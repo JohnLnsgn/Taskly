@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Taskly</title>
- 
+
   <!--
     ============================================================
     FONT: Google Sans
@@ -19,7 +19,17 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&display=swap" rel="stylesheet" />
- 
+
+  <!--
+    ============================================================
+    AUTH: Google Identity Services
+    ============================================================
+    Google's official sign-in library. `async defer` lets the page
+    render without waiting for it. The code checks that it has loaded
+    (GoogleAuth.isLoaded) before trying to use it.
+  -->
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+
   <!--
     ============================================================
     STYLING: Tailwind CSS (Play CDN)
@@ -27,7 +37,7 @@
     Tailwind is "utility-first": instead of writing custom CSS, you
     compose small single-purpose classes right in the markup
     (e.g. `rounded-2xl bg-surface p-4`).
- 
+
     NOTE: The Play CDN is perfect for prototypes and learning. For a
     production site, install Tailwind via its CLI/build step so the
     CSS is pre-compiled, smaller, and cached.
@@ -67,7 +77,7 @@
       },
     };
   </script>
- 
+
   <!--
     A tiny base stylesheet. Tailwind handles component styling; this
     block only covers global concerns that utilities can't express well:
@@ -75,21 +85,29 @@
   -->
   <style>
     :root { color-scheme: dark; --grid-line: #2a2a2e; }
- 
+
     /* Visible keyboard focus is an accessibility requirement, not decoration. */
     :focus-visible { outline: 2px solid #d6ff3d; outline-offset: 2px; }
- 
+
     * { scrollbar-width: thin; scrollbar-color: #3a3a3f transparent; }
- 
+
+    /* Description editor: Tailwind's reset removes list bullets and link colours, so restore them here. */
+    [data-rich-editor] { white-space: pre-wrap; overflow-wrap: anywhere; }
+    [data-rich-editor][data-empty="true"]::before { content: attr(data-placeholder); color: #6b6b70; pointer-events: none; }
+    [data-rich-editor] ul { list-style: disc; padding-left: 1.25rem; }
+    [data-rich-editor] ol { list-style: decimal; padding-left: 1.25rem; }
+    [data-rich-editor] a { color: #d6ff3d; text-decoration: underline; text-underline-offset: 2px; cursor: text; }
+    [data-rich-toolbar] button[aria-pressed="true"] { background: rgb(255 255 255 / 0.12); color: #f4f4f5; }
+
     /* Respect users who ask their OS to minimise animation. */
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
     }
   </style>
 </head>
- 
+
 <body class="h-full bg-canvas font-sans text-ink antialiased">
- 
+
   <!--
     ============================================================
     APP SHELL
@@ -97,68 +115,72 @@
     The HTML is only a skeleton of named "slots" (elements whose id
     starts with `slot-`). Each slot is owned by exactly one JavaScript
     module (see the MODULES section below), which fills it with markup.
- 
+
     Layout is mobile-first: a column on small screens, a row from the
     `md:` breakpoint up. The `lg:` breakpoint reveals the sidebar.
   -->
   <div id="app" class="flex h-full flex-col gap-3 p-3 md:flex-row">
- 
+
     <!-- Slot: primary navigation rail -->
     <nav id="slot-rail" aria-label="Primary"
          class="flex shrink-0 flex-row items-center gap-2 rounded-2xl bg-surface p-2 md:w-[4.5rem] md:flex-col md:py-4"></nav>
- 
+
     <!-- Sidebar: hidden on small screens, visible on large ones -->
     <aside class="hidden w-72 shrink-0 flex-col gap-3 overflow-y-auto lg:flex" aria-label="Calendar tools">
       <div id="slot-workspace"></div>
       <div id="slot-mini-calendar"></div>
+      <div id="slot-gcal"></div>
       <div id="slot-accounts" class="flex flex-col gap-3"></div>
     </aside>
- 
+
     <!-- Main area: every "page" module mounts inside #slot-pages -->
     <main id="slot-pages" class="min-h-0 min-w-0 flex-1">
- 
+
       <!-- The calendar page has a static shell so its scroll position
            survives re-renders (only the inner slots get re-rendered). -->
       <section id="page-calendar" class="flex h-full flex-col overflow-hidden rounded-2xl bg-surface">
         <header id="slot-calendar-header" class="shrink-0"></header>
         <div id="slot-calendar-body" class="min-h-0 flex-1 overflow-auto border-t border-line"></div>
       </section>
- 
+
     </main>
   </div>
- 
+
   <!-- Overlays live outside #app so they can cover the whole viewport -->
+  <div id="slot-account-menu"></div>
+  <div id="slot-auth-modal"></div>
   <div id="slot-modal"></div>
   <div id="slot-toast" aria-live="polite"
        class="pointer-events-none fixed inset-x-0 bottom-6 z-[60] flex justify-center px-4"></div>
- 
- 
+
+
   <script>
   /* ==================================================================
-     CRONIX CALENDAR: ARCHITECTURE OVERVIEW
+     Taskly: ARCHITECTURE OVERVIEW
      ==================================================================
      This file is organised into numbered sections. Each has ONE job
      ("separation of concerns"), which is what makes a codebase easy to
      grow:
- 
+
        1. CONFIG      Constants. No magic numbers scattered around.
        2. UTILITIES   Pure helper functions (dates, escaping, icons).
        3. STORE       The single source of truth for app state.
        4. SELECTORS   Read-only functions that derive data from state.
        5. ACTIONS     The ONLY functions that change state.
+       5b. GOOGLE CAL  Two-way sync between Taskly and the user's Google Calendar.
        6. REGISTRY    Mounts modules and keeps them in sync with state.
        7. MODULES     Self-contained UI pieces (rail, calendar, modal...).
        8. BOOTSTRAP   Wires everything together and starts the app.
- 
+
      DATA FLOW (one direction, easy to debug):
- 
+
        user clicks  ->  Action  ->  Store updates  ->  Modules re-render
- 
+
      ------------------------------------------------------------------
      HOW TO ADD A NEW MODULE (3 steps)
      ------------------------------------------------------------------
        1. Write a module object:
- 
+
             const MyModule = {
               id:   'my-module',          // unique, kebab-case
               slot: '#slot-my-module',    // where it mounts
@@ -166,11 +188,11 @@
               render: (state, ctx) => `<p>Hello</p>`, // returns an HTML string
               bind: (el, ctx) => { ... },            // optional: attach event listeners ONCE
             };
- 
+
        2. Add it to the list in the BOOTSTRAP section.
        3. (Optional) Need a whole new page? Add `route`, `createIn` and
           `slotClass` (see createPlaceholderPage) and no HTML edits are needed.
- 
+
      NAMING CONVENTIONS USED HERE
        - UPPER_SNAKE_CASE  constants           (CONFIG, ICON_PATHS)
        - PascalCase        module objects      (MiniCalendarModule)
@@ -179,13 +201,16 @@
        - data-* attributes are the "hooks" JavaScript uses to find
          elements, so styling classes can change without breaking logic.
      ================================================================== */
- 
+
   (() => {
     'use strict'; // Opt in to stricter, safer JavaScript rules.
- 
+
     /* ================================================================
        1. CONFIG
        ================================================================ */
+    /** Lets the app create, edit and delete events on the user's Google calendars. */
+    const GOOGLE_CALENDAR_SCOPE = 'https://www.googleapis.com/auth/calendar.events';
+
     const CONFIG = Object.freeze({
       LOCALE: 'en-US',
       HOUR_HEIGHT: 56,            // px height of one hour in the time grid
@@ -194,14 +219,53 @@
       DEFAULT_SCROLL_HOUR: 7,     // where the grid scrolls to on load
       TOAST_DURATION_MS: 3200,
       TICK_INTERVAL_MS: 60_000,   // how often the "now" line moves
-      STORAGE_KEY: 'cronix-calendar.v1',
+      STORAGE_KEY: 'taskly.v1',
       EVENT_TEXT_COLOR: '#141414',
+
+      // --- Authentication ---------------------------------------------
+      // Create an "OAuth client ID" (type: Web application) in the Google
+      // Cloud Console, add your site's origin (e.g. http://localhost:5500)
+      // under "Authorised JavaScript origins", then paste the ID here.
+      // A client ID is public by design, so it is safe in front-end code.
+      GOOGLE_CLIENT_ID: '482114785955-l0l3piactqsn2hsv2i9qm4mij81t99de.apps.googleusercontent.com',
+      GOOGLE_CALENDAR_SCOPE,
+      // Asking for the calendar scope at sign-in means ONE consent screen covers both.
+      GOOGLE_SCOPES: `openid email profile ${GOOGLE_CALENDAR_SCOPE}`,
+      GOOGLE_USERINFO_URL: 'https://openidconnect.googleapis.com/v1/userinfo',
+
+      // --- Google Calendar sync -------------------------------------------
+      // OPTIONAL. Calendar requests are authorised by the signed-in user's OAuth
+      // token, so no API key is needed. If you create one (Cloud Console >
+      // APIs & Services > Credentials), paste it here to attribute requests to
+      // your project, and restrict it to the Google Calendar API + your site.
+      GOOGLE_API_KEY: '',
+
+      // --- Google Drive attachments ---------------------------------------
+      // The "Attach from Google Drive" button opens Google's own file picker.
+      // To turn it on:
+      //   1. Enable the "Google Picker API" in your Google Cloud project.
+      //   2. Create a browser API key (restricted to the Picker API and your
+      //      site) and paste it below.
+      //   3. Add the .../auth/drive.file scope to your OAuth consent screen.
+      // Taskly only sees the files you pick. Until a key is set, the button
+      // falls back to pasting a Drive / Docs link.
+      GOOGLE_PICKER_API_KEY: '',
+      GOOGLE_DRIVE_SCOPE: 'https://www.googleapis.com/auth/drive.file',
+      GOOGLE_CALENDAR_API: 'https://www.googleapis.com/calendar/v3',
+      GOOGLE_SYNC_INTERVAL_MS: 30_000, // how often Google is checked for changes (tab visible)
+      GOOGLE_SYNC_MONTHS_BEFORE: 2,    // months before the viewed month that are kept in step
+      GOOGLE_SYNC_MONTHS_AFTER: 4,     // months after the viewed month that are kept in step
+      // Whether Google emails guests when a schedule with guests is saved:
+      // 'none' (default), 'externalOnly' (non-Google guests) or 'all'.
+      GOOGLE_SEND_INVITES: 'none',
+      ACCOUNT_MENU_WIDTH: 288,     // px width of the account popup
+      OPEN_LOGIN_ON_LAUNCH: false, // true = show the sign-in popup on first load
     });
- 
+
     /* ================================================================
        2. UTILITIES (pure functions: same input -> same output)
        ================================================================ */
- 
+
     /**
      * Escape text before putting it into an HTML string.
      * ALWAYS do this for anything a user can type. Skipping it allows
@@ -211,9 +275,9 @@
       String(value ?? '').replace(/[&<>"']/g, (ch) => (
         { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]
       ));
- 
+
     const pad2 = (n) => String(n).padStart(2, '0');
- 
+
     const DateUtils = {
       startOfDay(date) {
         const d = new Date(date);
@@ -256,6 +320,18 @@
         const hours12 = hours24 % 12 === 0 ? 12 : hours24 % 12;
         return minutes ? `${hours12}:${pad2(minutes)} ${suffix}` : `${hours12} ${suffix}`;
       },
+      /** 990 -> "4:30 PM", 720 -> "12:00 PM", 1440 -> "12:00 AM" (always shows minutes; used in form fields). */
+      formatTimeField(totalMinutes) {
+        const hours24 = Math.floor(totalMinutes / 60) % 24;
+        const hours12 = hours24 % 12 === 0 ? 12 : hours24 % 12;
+        return `${hours12}:${pad2(totalMinutes % 60)} ${hours24 >= 12 ? 'pm' : 'am'}`;
+      },
+      /** "Tuesday, September 29": how a date is shown in the schedule form. */
+      formatDateField: (d) => d.toLocaleDateString(CONFIG.LOCALE, { weekday: 'long', month: 'long', day: 'numeric' }),
+      /** Label used wherever an event's time range is shown. */
+      formatRange: (event) => event.allDay
+        ? 'All day'
+        : `${DateUtils.formatTime(event.start)} - ${DateUtils.formatTime(event.end)}`,
       formatMonthYear: (d) => d.toLocaleDateString(CONFIG.LOCALE, { month: 'long', year: 'numeric' }),
       formatWeekdayShort: (d) => d.toLocaleDateString(CONFIG.LOCALE, { weekday: 'short' }),
       formatLong: (d) => d.toLocaleDateString(CONFIG.LOCALE, { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' }),
@@ -269,13 +345,120 @@
         return `GMT${offset >= 0 ? '+' : '-'}${Math.floor(abs / 60)}${minutes ? ':' + pad2(minutes) : ''}`;
       },
     };
- 
+
+    /**
+     * Default time range for a new schedule: the closest :30 mark to `date`
+     * (4:10 -> 4:30, 4:50 -> 4:30, 5:05 -> 5:30) and one hour after it.
+     * Minutes since midnight; the end is capped at 24:00.
+     */
+    function closestHalfHourRange(date) {
+      const now = DateUtils.minutesSinceMidnight(date);
+      const start = Math.min(Math.max(Math.round((now - 30) / 60) * 60 + 30, 0), 23 * 60 + 30);
+      return { start, end: Math.min(start + 60, 24 * 60) };
+    }
+
+    /**
+     * Read a typed time and return minutes since midnight, or null if invalid.
+     * Accepts 12-hour input with am/pm ("4:30pm", "4 PM", "4.30 p.m.") and
+     * 24-hour input ("16:30", "1630", "930"). Input with no am/pm is read as
+     * 24-hour ("16:30" = 4:30 PM, "4:30" = 4:30 AM). `hadSuffix` tells the
+     * caller whether am/pm was typed, so it can make a smarter guess when it
+     * wasn't. For an end time, midnight ("12am", "00:00", "24:00") means the
+     * end of the day (1440), because an end can never be 0.
+     */
+    function parseTimeInput(raw, { allowEndOfDay = false } = {}) {
+      const text = String(raw ?? '').trim().toLowerCase().replace(/\./g, '');
+      const match = text.match(/^(\d{1,2})(\d{2})\s*(am|pm|a|p)?$/)                    // "430", "1630", "430pm"
+        ?? text.match(/^(\d{1,2})(?:\s*[:h\s]\s*(\d{1,2}))?\s*(am|pm|a|p)?$/);      // "4", "4:30", "4 pm", "16h30"
+      if (!match) return null;
+
+      let hours = Number(match[1]);
+      const minutes = match[2] === undefined ? 0 : Number(match[2]);
+      const suffix = match[3]?.[0]; // 'a' | 'p' | undefined
+      if (minutes > 59) return null;
+
+      if (suffix) {
+        if (hours < 1 || hours > 12) return null;
+        hours = (hours % 12) + (suffix === 'p' ? 12 : 0);
+      } else if (hours === 24 && minutes === 0 && allowEndOfDay) {
+        return { minutes: 24 * 60, hadSuffix: false };
+      } else if (hours > 23) {
+        return null;
+      }
+      let total = hours * 60 + minutes;
+      if (allowEndOfDay && total === 0) total = 24 * 60;
+      return { minutes: total, hadSuffix: Boolean(suffix), typedHours: Number(match[1]) };
+    }
+
+    /**
+     * Read a typed date and return a Date, or null if invalid. Accepts things
+     * like "Sep 29", "september 29", "29 sep", "9/29", "9/29/27", "2026-09-29",
+     * "Tuesday, September 29", "tue", "today" and "tomorrow". When no year is
+     * typed, it picks the year that lands closest to `reference` (the date the
+     * field held before), so "Jan 5" typed in late September means next January.
+     */
+    const MONTH_NAMES = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'];
+    const WEEKDAY_NAMES = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+    function parseDateInput(raw, reference, today = new Date()) {
+      const nameIndex = (word, names) => (word.length >= 3 ? names.findIndex((n) => n.startsWith(word)) : -1);
+      let text = String(raw ?? '').trim().toLowerCase()
+        .replace(/[,.]/g, ' ').replace(/(\d)(st|nd|rd|th)\b/g, '$1').replace(/\s+/g, ' ').trim();
+      if (!text) return null;
+
+      const base = DateUtils.startOfDay(today);
+      if (text === 'today') return base;
+      if (text === 'tomorrow' || text === 'tmrw') return DateUtils.addDays(base, 1);
+      if (text === 'yesterday') return DateUtils.addDays(base, -1);
+
+      // Drop a leading weekday ("tuesday sep 29"); a lone weekday means its next occurrence.
+      const words = text.split(' ');
+      if (nameIndex(words[0], WEEKDAY_NAMES) >= 0 && nameIndex(words[0], MONTH_NAMES) < 0) {
+        if (words.length === 1) {
+          const target = nameIndex(words[0], WEEKDAY_NAMES);
+          return DateUtils.addDays(base, (target - base.getDay() + 7) % 7);
+        }
+        text = words.slice(1).join(' ');
+      }
+
+      let month; let day; let year;
+      let m;
+      if ((m = text.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})$/))) {
+        [year, month, day] = [Number(m[1]), Number(m[2]) - 1, Number(m[3])];
+      } else if ((m = text.match(/^(\d{1,2})[-/.](\d{1,2})(?:[-/.](\d{4}|\d{2}))?$/))) {
+        let [a, b] = [Number(m[1]), Number(m[2])];
+        if (a > 12 && b <= 12) [a, b] = [b, a]; // "29/9" can only be day/month
+        [month, day] = [a - 1, b];
+        if (m[3]) year = m[3].length === 2 ? 2000 + Number(m[3]) : Number(m[3]);
+      } else if ((m = text.match(/^([a-z]+) ?(\d{1,2})(?: (\d{4}|\d{2}))?$/)) && nameIndex(m[1], MONTH_NAMES) >= 0) {
+        [month, day] = [nameIndex(m[1], MONTH_NAMES), Number(m[2])];
+        if (m[3]) year = m[3].length === 2 ? 2000 + Number(m[3]) : Number(m[3]);
+      } else if ((m = text.match(/^(\d{1,2}) ?([a-z]+)(?: (\d{4}|\d{2}))?$/)) && nameIndex(m[2], MONTH_NAMES) >= 0) {
+        [month, day] = [nameIndex(m[2], MONTH_NAMES), Number(m[1])];
+        if (m[3]) year = m[3].length === 2 ? 2000 + Number(m[3]) : Number(m[3]);
+      } else {
+        return null;
+      }
+      if (month < 0 || month > 11 || day < 1) return null;
+
+      const build = (y) => {
+        const d = new Date(y, month, day);
+        return d.getMonth() === month && d.getDate() === day ? d : null; // rejects "Feb 30"
+      };
+      if (year !== undefined) return build(year);
+
+      const ref = reference ?? base;
+      const candidates = [ref.getFullYear() - 1, ref.getFullYear(), ref.getFullYear() + 1, ref.getFullYear() + 2]
+        .map(build).filter(Boolean);
+      if (!candidates.length) return null;
+      return candidates.reduce((best, d) => (Math.abs(d - ref) < Math.abs(best - ref) ? d : best));
+    }
+
     /** Unique id generator with a fallback for older browsers. */
     const createId = () =>
       (window.crypto && crypto.randomUUID)
         ? crypto.randomUUID()
         : `id-${Date.now()}-${Math.random().toString(16).slice(2)}`;
- 
+
     /**
      * Inline SVG icons. Keeping them in one dictionary means every icon
      * is defined once and reused everywhere via icon('name').
@@ -299,14 +482,27 @@
       clock: '<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
       user: '<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
       link: '<path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/>',
+      description: '<path d="M4 6h16M4 12h16M4 18h10"/>',
       arrowRight: '<path d="M5 12h14m-7-7 7 7-7 7"/>',
       trash: '<path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/>',
       calendarSmall: '<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/>',
+      login: '<path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4M10 17l5-5-5-5M15 12H3"/>',
+      swap: '<path d="m17 4 4 4-4 4M21 8H8M7 20l-4-4 4-4M3 16h13"/>',
+      check: '<path d="M20 6 9 17l-5-5"/>',
+      refresh: '<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>',
+      drive: '<path d="M8 3h8l6 11-4 6H6l-4-6z"/><path d="m8 3 6 11M2 14h20"/>',
+      bold: '<path d="M7 5h6a3.5 3.5 0 0 1 0 7H7zM7 12h7a3.5 3.5 0 0 1 0 7H7z"/>',
+      italic: '<path d="M19 4h-9M14 20H5M15 4 9 20"/>',
+      underline: '<path d="M6 4v7a6 6 0 0 0 12 0V4M4 21h16"/>',
+      listOrdered: '<path d="M10 6h11M10 12h11M10 18h11M4 6h1v4M4 10h2M6 18H4c0-1 2-2 2-3s-1-1.5-2-1"/>',
+      listBullet: '<path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/>',
+      removeFormat: '<path d="M4 7V4h16v3M5 20h6M13 4 8 20M15 15l5 5M20 15l-5 5"/>',
+      file: '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/>',
     };
- 
+
     const icon = (name, classes = 'h-5 w-5') =>
       `<svg class="${classes}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICON_PATHS[name]}</svg>`;
- 
+
     /** Persist only what matters (events + accounts) to localStorage. */
     const Persistence = {
       load() {
@@ -319,7 +515,7 @@
         try { localStorage.setItem(CONFIG.STORAGE_KEY, JSON.stringify(data)); } catch { /* ignore */ }
       },
     };
- 
+
     /* ================================================================
        3. STORE: a tiny "publish/subscribe" state container
        ================================================================
@@ -332,7 +528,7 @@
     function createStore(initialState) {
       let state = initialState;
       const listeners = new Set();
- 
+
       return {
         getState: () => state,
         /** Accepts an object patch OR a function (state) => patch. */
@@ -347,17 +543,53 @@
         },
       };
     }
- 
+
+    /**
+     * What a schedule is for. Each purpose is a calendar (its colour and its
+     * visibility toggle in the sidebar), and these three are what the
+     * "purpose" dropdown in the schedule form offers.
+     */
+    const PURPOSES = Object.freeze([
+      { id: 'personal', name: 'Personal', color: '#6f9bff' },
+      { id: 'academic', name: 'Academic', color: '#d6ff3d' },
+      { id: 'work',     name: 'Work',     color: '#ff6b6b' },
+    ]);
+    const createPurposeCalendars = () => PURPOSES.map((purpose) => ({ ...purpose, visible: true }));
+
+    /** Calendars from earlier versions of the app and the purpose that replaces each. */
+    const LEGACY_PURPOSE = Object.freeze({ project: 'academic', freelance: 'work', focus: 'academic' });
+
+    /**
+     * Bring saved data from an older version up to date: the first account gets
+     * the three purposes (keeping any on/off toggles the user set), and events
+     * on retired calendars move to their replacement. Safe to run repeatedly.
+     */
+    function migrateWorkspace(workspace) {
+      const accounts = workspace.accounts ?? [];
+      if (!accounts.length) return workspace;
+      const [first, ...rest] = accounts;
+      const old = first.calendars ?? [];
+      const wasVisible = (purposeId) => {
+        const related = old.filter((c) => c.id === purposeId || LEGACY_PURPOSE[c.id] === purposeId);
+        return related.length ? related.some((c) => c.visible) : true;
+      };
+      const purposeIds = new Set(PURPOSES.map((p) => p.id));
+      const custom = old.filter((c) => !purposeIds.has(c.id) && !LEGACY_PURPOSE[c.id]);
+      const calendars = [...PURPOSES.map((p) => ({ ...p, visible: wasVisible(p.id) })), ...custom];
+      return {
+        ...workspace,
+        accounts: [{ ...first, calendars }, ...rest],
+        events: (workspace.events ?? []).map((e) =>
+          LEGACY_PURPOSE[e.calendarId] ? { ...e, calendarId: LEGACY_PURPOSE[e.calendarId] } : e),
+      };
+    }
+
     /* ---------- Seed data (used on first visit only) ---------- */
     function createSeedAccounts() {
       return [
         {
           id: 'account-primary', email: 'you@gmail.com', expanded: true,
-          calendars: [
-            { id: 'project',   name: 'Project time',        color: '#ff6b6b', visible: true },
-            { id: 'personal',  name: 'Me time',             color: '#6f9bff', visible: true },
-            { id: 'freelance', name: 'Freelance work time', color: '#d6ff3d', visible: true },
-          ],
+          calendars: createPurposeCalendars(),
         },
         {
           id: 'account-work', email: 'work@gmail.com', expanded: false,
@@ -365,52 +597,89 @@
         },
       ];
     }
- 
+
+    /** Calendars a newly signed-in user starts with (named after their email). */
+    function createDefaultAccounts(email) {
+      return [{
+        id: 'account-primary', email, expanded: true,
+        calendars: createPurposeCalendars(),
+      }];
+    }
+
     /** dayOffset: 0 = Monday of the current week. Times are minutes since midnight. */
     function createSeedEvents(weekStart) {
       const at = (dayOffset) => DateUtils.toKey(DateUtils.addDays(weekStart, dayOffset));
       const h = (hours, minutes = 0) => hours * 60 + minutes;
       const make = (dayOffset, title, start, end, calendarId) =>
         ({ id: createId(), title, date: at(dayOffset), start, end, calendarId, guests: [], link: '' });
- 
+
       return [
-        make(0, 'Project preparation',       h(8, 30), h(12, 30), 'project'),
-        make(0, 'Ideation in the café',      h(14),    h(16),     'project'),
+        make(0, 'Project preparation',       h(8, 30), h(12, 30), 'academic'),
+        make(0, 'Ideation in the café',      h(14),    h(16),     'academic'),
         make(1, 'Travel to Berlin',          h(9, 30), h(14),     'personal'),
-        make(2, 'Work from café',            h(8, 30), h(10, 45), 'freelance'),
+        make(2, 'Work from café',            h(8, 30), h(10, 45), 'work'),
         make(2, 'Lunch in Berlin',           h(11),    h(12),     'personal'),
-        make(2, '2025 portfolio planning',   h(13),    h(16),     'freelance'),
+        make(2, '2025 portfolio planning',   h(13),    h(16),     'work'),
         make(3, 'Work from café',            h(8, 30), h(10, 30), 'personal'),
-        make(3, 'Sketching & wireframing',   h(11),    h(15),     'project'),
-        make(4, 'Weekly design exploration', h(9, 30), h(14),     'freelance'),
-        make(5, 'High-fidelity designing',   h(8, 30), h(12),     'project'),
+        make(3, 'Sketching & wireframing',   h(11),    h(15),     'academic'),
+        make(4, 'Weekly design exploration', h(9, 30), h(14),     'work'),
+        make(5, 'High-fidelity designing',   h(8, 30), h(12),     'academic'),
         make(5, 'Explore Schwarzwald',       h(13),    h(16),     'personal'),
-        make(6, 'Work from café',            h(8, 30), h(11),     'freelance'),
+        make(6, 'Work from café',            h(8, 30), h(11),     'work'),
         make(6, 'Lunch at the Barn Café',    h(11),    h(12, 30), 'personal'),
-        make(6, 'Feedback and prototyping',  h(12, 30), h(16),    'project'),
+        make(6, 'Feedback and prototyping',  h(12, 30), h(16),    'academic'),
       ];
     }
- 
+
     function createInitialState() {
       const today = DateUtils.startOfDay(new Date());
       const saved = Persistence.load();
+
+      // Only profile info is saved for users (name, email, picture). Google
+      // access tokens are used once and thrown away, never stored.
+      const users = saved?.auth?.users ?? [];
+      const activeUserId = users.some((u) => u.id === saved?.auth?.activeUserId)
+        ? saved.auth.activeUserId
+        : (users[0]?.id ?? null);
+
+      // Older saves kept events at the top level: treat those as the guest workspace.
+      const workspaces = saved?.workspaces
+        ?? (saved?.events ? { guest: { events: saved.events, accounts: saved.accounts } } : {});
+      const current = loadWorkspace(workspaces, users, activeUserId);
+
       return {
         activeRoute: 'calendar',   // which page is visible
         view: 'week',              // 'day' | 'week' | 'month'
         currentDate: today,        // the date the calendar is focused on
         miniMonth: DateUtils.firstOfMonth(today), // month shown in the mini calendar
         now: new Date(),           // updated every minute for the "now" line
-        accounts: saved?.accounts ?? createSeedAccounts(),
-        events: saved?.events ?? createSeedEvents(DateUtils.startOfWeek(today)),
+
+        // Authentication
+        users,                     // [{ id, name, email, picture }]
+        activeUserId,              // null = signed out ("guest")
+        workspaces,                // cached data for users who are not active
+        loginModal: null,          // null | { mode: 'signin' | 'add' }
+        authLoading: false,        // true while the Google popup is open
+        authError: '',
+        accountMenu: null,         // null | { top, left, width } (popup position)
+
+        // Data for the ACTIVE user
+        accounts: current.accounts,
+        events: current.events,
+
         modal: null,               // null | { mode: 'create' | 'edit', event }
         toast: null,               // null | { id, message }
+
+        // Google Calendar sync (per active user; tokens are never stored)
+        gcal: { status: 'off', lastSync: null, message: '' }, // status: 'off' | 'syncing' | 'synced' | 'error'
       };
     }
- 
+
     /* ================================================================
        4. SELECTORS: derive data from state without changing it
        ================================================================ */
     const Selectors = {
+      activeUser: (state) => state.users.find((user) => user.id === state.activeUserId) ?? null,
       allCalendars: (state) => state.accounts.flatMap((account) => account.calendars),
       calendarMap: (state) => new Map(Selectors.allCalendars(state).map((cal) => [cal.id, cal])),
       /** Only events whose calendar is switched on. */
@@ -429,7 +698,7 @@
         return map;
       },
     };
- 
+
     /**
      * Side-by-side layout for overlapping events ("lanes").
      * Returns [{ event, lane, lanes }] so the UI can compute left/width.
@@ -439,7 +708,7 @@
       const result = [];
       let cluster = [];
       let clusterEnd = -1;
- 
+
       const flushCluster = () => {
         const laneEnds = [];
         const placed = cluster.map((event) => {
@@ -451,7 +720,7 @@
         placed.forEach((item) => result.push({ ...item, lanes: laneEnds.length }));
         cluster = [];
       };
- 
+
       sorted.forEach((event) => {
         if (cluster.length && event.start >= clusterEnd) flushCluster();
         cluster.push(event);
@@ -460,7 +729,7 @@
       flushCluster();
       return result;
     }
- 
+
     /* ================================================================
        CALENDAR VIEW REGISTRY
        ================================================================
@@ -475,15 +744,918 @@
       const start = DateUtils.startOfWeek(date);
       return Array.from({ length: 7 }, (_, i) => DateUtils.addDays(start, i));
     };
- 
+
     /* ================================================================
        5. ACTIONS: the only code allowed to change state
        ================================================================ */
+    /* ---------- Per-user workspaces ----------
+       Each signed-in user gets their own events and calendars. When the
+       active user changes, we stash the current data and load the target's.
+       "guest" is the signed-out workspace (it keeps the demo data). */
+    function stashWorkspace(state) {
+      return { ...state.workspaces, [state.activeUserId ?? 'guest']: { events: state.events, accounts: state.accounts } };
+    }
+
+    function loadWorkspace(workspaces, users, userId) {
+      const existing = workspaces[userId ?? 'guest'];
+      if (existing) return migrateWorkspace(existing);
+      const user = users.find((u) => u.id === userId);
+      return user
+        ? { events: [], accounts: createDefaultAccounts(user.email) }
+        : { events: createSeedEvents(DateUtils.startOfWeek(new Date())), accounts: createSeedAccounts() };
+    }
+
+    /** Builds the state patch that makes `userId` the active user. */
+    function buildSwitchPatch(state, users, userId) {
+      const workspaces = stashWorkspace(state);
+      const target = loadWorkspace(workspaces, users, userId);
+      return { users, workspaces, activeUserId: userId, events: target.events, accounts: target.accounts };
+    }
+
+    /* ---------- Google sign-in (Google Identity Services) ----------
+       We use the "token client": it opens Google's own account-chooser
+       popup and hands back a short-lived access token. We use that token
+       once to read the profile from Google's userinfo endpoint. */
+    const GoogleAuth = {
+      isConfigured: () => Boolean(CONFIG.GOOGLE_CLIENT_ID) && !CONFIG.GOOGLE_CLIENT_ID.startsWith('YOUR_'),
+      isLoaded: () => Boolean(window.google?.accounts?.oauth2),
+
+      /**
+       * Resolves with { profile: { id, name, email, picture }, grant: { accessToken, expiresIn, calendar } }.
+       * `calendar` is false if the user unticked the calendar permission. Must be called from a click handler.
+       */
+      requestProfile() {
+        return new Promise((resolve, reject) => {
+          const client = google.accounts.oauth2.initTokenClient({
+            client_id: CONFIG.GOOGLE_CLIENT_ID,
+            scope: CONFIG.GOOGLE_SCOPES,
+            callback: async (response) => {
+              if (response.error) return reject(new Error('Google sign-in failed. Please try again.'));
+              try {
+                const res = await fetch(CONFIG.GOOGLE_USERINFO_URL, {
+                  headers: { Authorization: `Bearer ${response.access_token}` },
+                });
+                if (!res.ok) throw new Error('bad response');
+                const profile = await res.json();
+                resolve({
+                  profile: { id: profile.sub, name: profile.name || profile.email, email: profile.email, picture: profile.picture || '' },
+                  grant: {
+                    accessToken: response.access_token,
+                    expiresIn: response.expires_in,
+                    calendar: google.accounts.oauth2.hasGrantedAllScopes(response, CONFIG.GOOGLE_CALENDAR_SCOPE),
+                  },
+                });
+              } catch {
+                reject(new Error('Could not load your Google profile. Please try again.'));
+              }
+            },
+            error_callback: (err) => {
+              const cancelled = err?.type === 'popup_closed';
+              const error = new Error(cancelled ? 'Sign-in was cancelled.' : 'Google sign-in could not open. Allow pop-ups and try again.');
+              error.cancelled = cancelled;
+              reject(error);
+            },
+          });
+          // `select_account` always shows the chooser, which is what "add account" needs.
+          client.requestAccessToken({ prompt: 'select_account' });
+        });
+      },
+    };
+
+    /* ================================================================
+       5b. GOOGLE CALENDAR SYNC
+       ================================================================
+       Taskly talks to the Google Calendar REST API (v3) directly with
+       fetch(). No extra library is needed: the access token from Google
+       sign-in goes in an Authorization header.
+
+       HOW THE TWO CALENDARS STAY IN STEP
+         Taskly -> Google   Saving or deleting a schedule sends that change
+                            to the user's PRIMARY Google calendar right away.
+         Google -> Taskly   Every 30 seconds (while the tab is visible), when
+                            the tab regains focus, when you move to a month
+                            that hasn't been loaded, and when you press Sync,
+                            Taskly downloads the nearby events and updates
+                            itself to match (adds, edits and deletions).
+
+       HOW A SCHEDULE MAPS TO A GOOGLE EVENT
+         title, date, time, all-day, guests, description   the same field
+         meeting link   ->  the event's "location" (Meet links are read too)
+         purpose        ->  an event colour (Personal = blue, Academic =
+                            yellow, Work = red) plus a hidden tag. Recolouring
+                            an event in Google Calendar changes its purpose here.
+
+       Events Taskly can't represent (multi-day, invitations you can't edit,
+       birthdays...) are shown but opened in Google Calendar to edit.
+
+       Access tokens live in memory only and last about an hour. When one
+       runs out, the sidebar card and header button offer "Reconnect".
+    */
+
+    /** Google's event colour ids that best match each purpose. */
+    const PURPOSE_COLOR_ID = Object.freeze({ personal: '9', academic: '5', work: '11' });
+
+    /** Google event types Taskly shows. Others (birthdays, working location...) are skipped. */
+    const SHOWN_GOOGLE_TYPES = new Set(['default', 'focusTime', 'outOfOffice', 'fromGmail']);
+    const WEB_URL = /^https?:\/\//i;
+    const MAX_SEGMENTS = 62; // longest multi-day event we will draw, in days
+
+    /* ---------- Rich-text descriptions ----------
+       A description is stored as a small, safe subset of HTML: <b> <i> <u>
+       <ul> <ol> <li> <a href> <br>. That is exactly what Google Calendar
+       understands, so formatting survives the round trip in both directions.
+       Descriptions saved before this existed are plain text, and are converted on the way in. */
+    const SAFE_URL = /^(https?:|mailto:)/i;
+    const RICH_SKIP = new Set(['script', 'style', 'noscript', 'template', 'iframe', 'object', 'embed', 'meta', 'link', 'title', 'head', 'svg', 'canvas', 'textarea', 'select']);
+    const RICH_BLOCK = new Set(['div', 'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote', 'pre', 'section', 'article', 'header', 'footer', 'table', 'tbody', 'tr']);
+
+    /**
+     * Reduce ANY html (typed, pasted, or downloaded from Google) to the safe subset above.
+     * This is the security boundary: output is rebuilt from an allow-list, and text and
+     * URLs are escaped, so nothing from the input can reach the page as markup.
+     */
+    function sanitizeRichText(html) {
+      const doc = new DOMParser().parseFromString(String(html ?? ''), 'text/html'); // parsing never runs scripts
+      const endsLine = (out) => out === '' || /(<br>|<\/ul>|<\/ol>)$/.test(out);
+
+      function walk(parent) {
+        let out = '';
+        parent.childNodes.forEach((node) => {
+          if (node.nodeType === 3) { out += esc(node.nodeValue.replace(/[\s\u00a0]+/g, ' ')); return; }
+          if (node.nodeType !== 1) return;
+          const tag = node.localName;
+          if (RICH_SKIP.has(tag)) return;
+          const style = (node.getAttribute('style') ?? '').toLowerCase();
+
+          if (tag === 'br') { out += '<br>'; return; }
+          if (tag === 'ul' || tag === 'ol') { const items = walk(node); if (items) out += `<${tag}>${items}</${tag}>`; return; }
+          if (tag === 'li') { out += `<li>${walk(node).replace(/(<br>)+$/, '')}</li>`; return; }
+          if (tag === 'a') {
+            const href = (node.getAttribute('href') ?? '').trim();
+            const body = walk(node);
+            out += body && SAFE_URL.test(href) ? `<a href="${esc(href)}">${body}</a>` : body;
+            return;
+          }
+          if (RICH_BLOCK.has(tag)) {
+            const body = walk(node);
+            if (!endsLine(out)) out += '<br>';            // a block starts on its own line
+            out += body;
+            if (!endsLine(out)) out += '<br>';            // ...and ends its line
+            return;
+          }
+
+          // Everything else is inline. Bold/italic/underline may arrive as tags or as CSS (pasted content).
+          let body = walk(node);
+          if (!body) return;
+          // Google Docs wraps pasted text in <b style="font-weight:normal">; that is NOT bold.
+          const bold = tag === 'b' || tag === 'strong' ? !/font-weight:\s*(normal|[1-4]00)/.test(style) : /font-weight:\s*(bold|[6-9]00)/.test(style);
+          const italic = tag === 'i' || tag === 'em' ? !/font-style:\s*normal/.test(style) : /font-style:\s*italic/.test(style);
+          const underline = tag === 'u' || /text-decoration[^;]*underline/.test(style);
+          if (underline) body = `<u>${body}</u>`;
+          if (italic) body = `<i>${body}</i>`;
+          if (bold) body = `<b>${body}</b>`;
+          out += body;
+        });
+        return out;
+      }
+
+      const cleaned = walk(doc.body)
+        .replace(/ *<br> */g, '<br>')
+        .replace(/\s*(<\/?(?:ul|ol|li)>)\s*/g, '$1')
+        .replace(/^(?:<br>|\s)+|(?:<br>|\s)+$/g, '')
+        .replace(/(?:<br>){4,}/g, '<br><br><br>');
+      return cleaned.replace(/<[^>]*>/g, '').trim() || /<li>/.test(cleaned) ? cleaned : '';
+    }
+
+    /** Any stored or downloaded description -> the safe HTML subset (plain text keeps its line breaks). */
+    function descriptionToHtml(raw) {
+      const source = String(raw ?? '');
+      if (!source.trim()) return '';
+      if (/<[a-z][\s\S]*>/i.test(source)) return sanitizeRichText(source);
+      return sanitizeRichText(esc(source).replace(/\r?\n/g, '<br>'));
+    }
+
+    /* ---------- Attachments (Google Drive files) ---------- */
+    const MAX_ATTACHMENTS = 25; // Google Calendar's limit per event
+
+    /** One attachment in Taskly's shape, or null if it is not usable (only https links are kept). */
+    function normalizeAttachment(a) {
+      const fileUrl = String(a?.fileUrl ?? '').trim();
+      if (!/^https:\/\//i.test(fileUrl)) return null;
+      const iconLink = String(a?.iconLink ?? '').trim();
+      return {
+        fileUrl,
+        title: String(a?.title ?? '').trim() || 'Untitled',
+        mimeType: String(a?.mimeType ?? ''),
+        fileId: String(a?.fileId ?? ''),
+        iconLink: /^https:\/\//i.test(iconLink) ? iconLink : '',
+      };
+    }
+
+    /** Read a pasted Google Drive / Docs / Sheets / Slides link. Returns null if it is not one. */
+    function parseDriveLink(input) {
+      let url;
+      try { url = new URL(String(input ?? '').trim()); } catch { return null; }
+      if (url.protocol !== 'https:' || !['docs.google.com', 'drive.google.com'].includes(url.hostname)) return null;
+      const path = url.pathname;
+      const fileId = path.match(/\/d\/([\w-]{10,})/)?.[1] ?? path.match(/\/folders\/([\w-]{10,})/)?.[1] ?? url.searchParams.get('id');
+      if (!fileId || !/^[\w-]{10,}$/.test(fileId)) return null;
+      const kinds = [
+        ['/document/', 'document', 'application/vnd.google-apps.document', 'Google Doc'],
+        ['/spreadsheets/', 'spreadsheets', 'application/vnd.google-apps.spreadsheet', 'Google Sheet'],
+        ['/presentation/', 'presentation', 'application/vnd.google-apps.presentation', 'Google Slides'],
+        ['/forms/', 'forms', 'application/vnd.google-apps.form', 'Google Form'],
+      ];
+      const kind = kinds.find(([segment]) => path.includes(segment));
+      if (kind) return { fileId, fileUrl: `https://docs.google.com/${kind[1]}/d/${fileId}/edit`, mimeType: kind[2], title: kind[3] };
+      if (path.includes('/folders/')) return { fileId, fileUrl: `https://drive.google.com/drive/folders/${fileId}`, mimeType: 'application/vnd.google-apps.folder', title: 'Drive folder' };
+      return { fileId, fileUrl: `https://drive.google.com/open?id=${fileId}`, mimeType: '', title: 'Drive file' };
+    }
+
+    /** Which purpose (Taskly calendar) a Google event belongs to. */
+    function purposeFromGoogle(item, validIds) {
+      const byColor = Object.keys(PURPOSE_COLOR_ID).find((id) => PURPOSE_COLOR_ID[id] === item.colorId);
+      const stored = item.extendedProperties?.private?.tasklyPurpose;
+      const pick = [byColor, stored, 'personal'].find((id) => id && validIds.has(id));
+      return pick ?? [...validIds][0] ?? 'personal';
+    }
+
+    function explainGoogleError(error) {
+      const reason = String(error.reason ?? '');
+      if (reason === 'accessNotConfigured' || reason === 'SERVICE_DISABLED') {
+        return 'The Google Calendar API is not enabled for your Google Cloud project yet.';
+      }
+      if (reason.startsWith('API_KEY') || /API key/i.test(error.message)) {
+        return 'Google rejected the API key. Check its restrictions, or leave GOOGLE_API_KEY empty.';
+      }
+      if (/rateLimit/i.test(reason)) return 'Google is rate-limiting requests. Sync will retry shortly.';
+      if (error.status) return `Google Calendar returned an error (${error.status}). Sync will retry.`;
+      return 'Could not reach Google Calendar. Check your connection.';
+    }
+
+    /* ---------- Tokens (memory only, never written to storage) ---------- */
+    const GoogleCalendarAuth = {
+      tokens: new Map(), // userId -> { token, expiresAt }
+
+      /** The token if it is still good for at least a minute, otherwise null. */
+      tokenFor(userId) {
+        const entry = this.tokens.get(userId);
+        return entry && entry.expiresAt - 60_000 > Date.now() ? entry.token : null;
+      },
+      remember(userId, token, expiresInSeconds) {
+        this.tokens.set(userId, { token, expiresAt: Date.now() + (Number(expiresInSeconds) || 3600) * 1000 });
+      },
+      forget(userId) { this.tokens.delete(userId); },
+
+      /**
+       * Ask Google for a Calendar-scoped token. Must be called from a click
+       * (it opens Google's popup). It also checks that the account chosen in
+       * the popup is the one this workspace belongs to.
+       */
+      request(user) {
+        return new Promise((resolve, reject) => {
+          const client = google.accounts.oauth2.initTokenClient({
+            client_id: CONFIG.GOOGLE_CLIENT_ID,
+            scope: CONFIG.GOOGLE_SCOPES,
+            hint: user.email,
+            callback: async (response) => {
+              if (response.error) return reject(new Error('Google Calendar access was not granted.'));
+              if (!google.accounts.oauth2.hasGrantedAllScopes(response, CONFIG.GOOGLE_CALENDAR_SCOPE)) {
+                return reject(new Error('Calendar permission was not ticked. Try again and allow calendar access.'));
+              }
+              try {
+                const res = await fetch(CONFIG.GOOGLE_USERINFO_URL, {
+                  headers: { Authorization: `Bearer ${response.access_token}` },
+                });
+                const profile = res.ok ? await res.json() : null;
+                if (profile?.sub !== user.id) return reject(new Error(`Choose ${user.email} to sync this workspace.`));
+              } catch {
+                return reject(new Error('Could not verify your Google account. Please try again.'));
+              }
+              GoogleCalendarAuth.remember(user.id, response.access_token, response.expires_in);
+              resolve(response.access_token);
+            },
+            error_callback: (err) => {
+              const cancelled = err?.type === 'popup_closed';
+              const error = new Error(cancelled ? 'Connection was cancelled.' : 'Google could not open its pop-up. Allow pop-ups and try again.');
+              error.cancelled = cancelled;
+              reject(error);
+            },
+          });
+          client.requestAccessToken({ prompt: '' });
+        });
+      },
+    };
+
+    /* ---------- The API + the two-way mapping ---------- */
+    const GoogleCalendar = {
+      /** Only real Google accounts sync; guests and demo users have no calendar to sync with. */
+      eligible: (user) => Boolean(user) && !user.demo && GoogleAuth.isConfigured(),
+
+      /**
+       * Google lets us choose an event's id if it uses only 0-9 and a-v (5 to
+       * 1024 characters). A Taskly id is a UUID, so removing the dashes gives a
+       * valid one. Choosing the id ourselves means a retried "create" can never
+       * make a duplicate.
+       */
+      idFor(taskId) {
+        const candidate = String(taskId).replace(/-/g, '').toLowerCase();
+        return /^[0-9a-v]{5,1024}$/.test(candidate) ? candidate : null;
+      },
+
+      /** One authenticated request. Errors carry `.status`, `.reason` and (when sign-in is the problem) `.code = 'auth'`. */
+      async call(userId, path, { method = 'GET', query = {}, body } = {}) {
+        const token = GoogleCalendarAuth.tokenFor(userId);
+        if (!token) throw Object.assign(new Error('Not connected to Google Calendar.'), { code: 'auth' });
+
+        const params = new URLSearchParams(query);
+        if (CONFIG.GOOGLE_API_KEY) params.set('key', CONFIG.GOOGLE_API_KEY); // optional: see CONFIG
+        const qs = params.toString();
+
+        const response = await fetch(`${CONFIG.GOOGLE_CALENDAR_API}${path}${qs ? `?${qs}` : ''}`, {
+          method,
+          headers: { Authorization: `Bearer ${token}`, ...(body ? { 'Content-Type': 'application/json' } : {}) },
+          body: body ? JSON.stringify(body) : undefined,
+        });
+        if (response.ok) return response.status === 204 ? null : response.json();
+
+        const detail = await response.json().catch(() => null);
+        const error = new Error(detail?.error?.message ?? `Google Calendar error ${response.status}`);
+        error.status = response.status;
+        error.reason = detail?.error?.errors?.[0]?.reason ?? detail?.error?.details?.[0]?.reason ?? detail?.error?.status ?? '';
+        if (response.status === 401 || error.reason === 'insufficientPermissions') error.code = 'auth';
+        throw error;
+      },
+
+      /**
+       * Google event -> a list of Taskly schedules (usually one). Taskly draws one
+       * block per day, so a multi-day event becomes one read-only block per day.
+       */
+      fromEvent(item, validIds) {
+        const type = item.eventType ?? 'default';
+        if (item.status === 'cancelled' || !item.start || !item.end || !SHOWN_GOOGLE_TYPES.has(type)) return [];
+
+        const attendees = (item.attendees ?? []).map(({ email, responseStatus, self, resource, organizer }) =>
+          ({ email, responseStatus, self, resource, organizer }));
+        if (attendees.some((a) => a.self && a.responseStatus === 'declined')) return []; // Google hides these too
+
+        const raw = item.description ?? '';
+        const text = descriptionToHtml(raw);
+        const location = item.location ?? '';
+        const isUrl = WEB_URL.test(location);
+        const allDay = Boolean(item.start.date);
+        const zeroLength = !allDay && new Date(item.end.dateTime) <= new Date(item.start.dateTime);
+
+        // Which day(s) does it cover, and from when to when on each?
+        const pieces = [];
+        if (allDay) {
+          const first = DateUtils.fromKey(item.start.date);
+          const days = Math.max(1, Math.round((DateUtils.fromKey(item.end.date) - first) / 86_400_000)); // end date is exclusive
+          for (let i = 0; i < Math.min(days, MAX_SEGMENTS); i += 1) {
+            pieces.push({ date: DateUtils.toKey(DateUtils.addDays(first, i)), start: 0, end: 24 * 60 });
+          }
+        } else if (zeroLength) {
+          const from = new Date(item.start.dateTime);
+          const start = DateUtils.minutesSinceMidnight(from);
+          pieces.push({ date: DateUtils.toKey(from), start, end: Math.min(start + 30, 24 * 60) });
+        } else {
+          const from = new Date(item.start.dateTime);
+          const to = new Date(item.end.dateTime);
+          const firstKey = DateUtils.toKey(from);
+          const lastDay = DateUtils.startOfDay(new Date(to.getTime() - 1)); // ending at exactly midnight stays on the earlier day
+          const lastKey = DateUtils.toKey(lastDay);
+          for (let day = DateUtils.startOfDay(from); day <= lastDay && pieces.length < MAX_SEGMENTS; day = DateUtils.addDays(day, 1)) {
+            const key = DateUtils.toKey(day);
+            pieces.push({
+              date: key,
+              start: key === firstKey ? DateUtils.minutesSinceMidnight(from) : 0,
+              end: key === lastKey ? (DateUtils.minutesSinceMidnight(to) || 24 * 60) : 24 * 60,
+            });
+          }
+        }
+        if (!pieces.length) return [];
+
+        // Only plain, single-day events you own (or may modify) can be edited from Taskly.
+        const editable = type === 'default'
+          && (!item.organizer || item.organizer.self === true || item.guestsCanModify === true);
+        const single = pieces.length === 1;
+        const readOnly = !editable || !single || zeroLength;
+        const htmlLink = readOnly && String(item.htmlLink ?? '').startsWith('https://') ? item.htmlLink : '';
+
+        const shared = {
+          gid: item.id, onGoogle: true, dirty: false, allDay, readOnly, htmlLink,
+          title: item.summary || '(No title)',
+          description: text,
+          attachments: (item.attachments ?? []).map(normalizeAttachment).filter(Boolean),
+          calendarId: purposeFromGoogle(item, validIds),
+          guests: attendees.filter((a) => a.email && !a.self && !a.resource).map((a) => a.email),
+          link: item.hangoutLink || (isUrl ? location : ''),
+          // "Google extras": things Taskly has no field for, kept so an edit doesn't wipe them.
+          gx: {
+            place: isUrl ? '' : location,
+            hangout: item.hangoutLink || '',
+            descRaw: text === raw ? '' : raw,
+            untitled: !item.summary,
+            attendees,
+          },
+        };
+        return pieces.map((piece) => ({ ...shared, ...piece, id: single ? item.id : `${item.id}~${piece.date}` }));
+      },
+
+      /** Taskly schedule -> the JSON Google expects. `patch` also clears the fields we are not using. */
+      toBody(event, { patch }) {
+        const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+        const at = (minutes) => {
+          const d = DateUtils.fromKey(event.date);
+          d.setMinutes(minutes); // 24:00 rolls over to midnight of the next day
+          return d.toISOString();
+        };
+        const nextDay = DateUtils.toKey(DateUtils.addDays(DateUtils.fromKey(event.date), 1)); // all-day ends are exclusive
+        const start = event.allDay ? { date: event.date } : { dateTime: at(event.start), timeZone: zone };
+        const end = event.allDay ? { date: nextDay } : { dateTime: at(event.end), timeZone: zone };
+        if (patch) {
+          // A PATCH merges objects, so explicitly clear whichever form we are not using.
+          const clear = event.allDay ? { dateTime: null, timeZone: null } : { date: null };
+          Object.assign(start, clear);
+          Object.assign(end, clear);
+        }
+
+        const gx = event.gx ?? {};
+        const keepsFormatting = gx.descRaw && event.description === descriptionToHtml(gx.descRaw);
+        const body = {
+          summary: gx.untitled && event.title === '(No title)' ? '' : event.title,
+          description: keepsFormatting ? gx.descRaw : (event.description ?? ''),
+          location: event.link && event.link !== gx.hangout ? event.link : (gx.place ?? ''),
+          start,
+          end,
+          extendedProperties: { private: { tasklyPurpose: event.calendarId } },
+        };
+        const colorId = PURPOSE_COLOR_ID[event.calendarId];
+        if (colorId) body.colorId = colorId;
+        else if (patch) body.colorId = null;
+
+        // Keep the owner entry and each guest's reply; add anyone new by email.
+        const known = gx.attendees ?? [];
+        const attendees = [
+          ...known.filter((a) => a.self || a.resource),
+          ...(event.guests ?? []).map((email) => known.find((a) => a.email === email) ?? { email }),
+        ];
+        if (attendees.length || patch) body.attendees = attendees;
+
+        // Drive files. Google reads the id from the link, so only link, name and type are sent.
+        const attachments = (event.attachments ?? []).map(({ fileUrl, title, mimeType }) =>
+          ({ fileUrl, title, ...(mimeType ? { mimeType } : {}) }));
+        if (attachments.length || patch) body.attachments = attachments;
+        return body;
+      },
+    };
+
+    /* ---------- Google Drive: picking files to attach ---------- */
+    const DriveAttach = {
+      tokens: new Map(), // userId -> { token, expiresAt }; memory only, like the Calendar tokens
+      pickerLoading: null,
+
+      /** The real picker needs a Google account, a Picker API key and Google's scripts. Otherwise the UI falls back to pasting a link. */
+      available: (user) => Boolean(user) && Boolean(CONFIG.GOOGLE_PICKER_API_KEY) && Boolean(window.google?.accounts?.oauth2),
+
+      /** Load Google's picker library once. */
+      loadPicker() {
+        this.pickerLoading ??= new Promise((resolve, reject) => {
+          const ready = () => window.gapi.load('picker', { callback: resolve, onerror: () => reject(new Error('Could not load the Google Drive picker.')) });
+          if (window.gapi?.load) return ready();
+          const script = document.createElement('script');
+          script.src = 'https://apis.google.com/js/api.js';
+          script.async = true;
+          script.onload = ready;
+          script.onerror = () => reject(new Error('Could not load the Google Drive picker.'));
+          document.head.append(script);
+        }).catch((error) => { this.pickerLoading = null; throw error; });
+        return this.pickerLoading;
+      },
+
+      /** A Drive token, asked for only when first needed (so nobody re-consents just to use the calendar). Call from a click. */
+      token(user) {
+        const cached = this.tokens.get(user.id);
+        if (cached && cached.expiresAt - 60_000 > Date.now()) return Promise.resolve(cached.token);
+        return new Promise((resolve, reject) => {
+          if (!window.google?.accounts?.oauth2) return reject(new Error('Google sign-in has not finished loading. Try again in a moment.'));
+          const client = google.accounts.oauth2.initTokenClient({
+            client_id: CONFIG.GOOGLE_CLIENT_ID,
+            scope: CONFIG.GOOGLE_DRIVE_SCOPE,
+            hint: user.email,
+            callback: (response) => {
+              if (response.error || !google.accounts.oauth2.hasGrantedAllScopes(response, CONFIG.GOOGLE_DRIVE_SCOPE)) {
+                return reject(new Error('Google Drive access was not granted.'));
+              }
+              this.tokens.set(user.id, { token: response.access_token, expiresAt: Date.now() + (Number(response.expires_in) || 3600) * 1000 });
+              resolve(response.access_token);
+            },
+            error_callback: (err) => {
+              const cancelled = err?.type === 'popup_closed';
+              reject(Object.assign(new Error(cancelled ? 'Drive connection was cancelled.' : 'Google could not open its pop-up. Allow pop-ups and try again.'), { cancelled }));
+            },
+          });
+          client.requestAccessToken({ prompt: '' });
+        });
+      },
+
+      /** Open Google's picker. Resolves with the chosen files (an empty list if cancelled). */
+      async pick(user) {
+        // Both start immediately, inside the click, so the browser allows Google's pop-up.
+        const [token] = await Promise.all([this.token(user), this.loadPicker()]);
+        return new Promise((resolve) => {
+          const { picker } = google;
+          const builder = new picker.PickerBuilder()
+            .setAppId(CONFIG.GOOGLE_CLIENT_ID.split('-')[0]) // the Cloud project number lets a drive.file token open the chosen files
+            .setOAuthToken(token)
+            .setDeveloperKey(CONFIG.GOOGLE_PICKER_API_KEY)
+            .addView(new picker.DocsView(picker.ViewId.DOCS).setIncludeFolders(true))
+            .addView(new picker.DocsUploadView())
+            .enableFeature(picker.Feature.MULTISELECT_ENABLED)
+            .setCallback((data) => {
+              const action = data[picker.Response.ACTION];
+              if (action === picker.Action.CANCEL) return resolve([]);
+              if (action !== picker.Action.PICKED) return;
+              resolve((data[picker.Response.DOCUMENTS] ?? []).map((doc) => ({
+                fileId: doc[picker.Document.ID],
+                fileUrl: doc[picker.Document.URL],
+                title: doc[picker.Document.NAME],
+                mimeType: doc[picker.Document.MIME_TYPE],
+                iconLink: doc[picker.Document.ICON_URL],
+              })));
+            });
+          builder.build().setVisible(true);
+        });
+      },
+    };
+
+    const googleUserOf = (state) => {
+      const user = Selectors.activeUser(state);
+      return GoogleCalendar.eligible(user) ? user : null;
+    };
+
+    /**
+     * Deletes that Google has not confirmed yet. Remembering them stops a
+     * schedule you deleted from coming back on the next pull, and lets a
+     * failed delete be retried. Stored as { [userId]: [googleEventId] }.
+     */
+    const PendingDeletes = {
+      KEY: 'taskly.google-deletes.v1',
+      read() {
+        try { return JSON.parse(localStorage.getItem(this.KEY)) ?? {}; } catch { return {}; }
+      },
+      write(all) {
+        try { localStorage.setItem(this.KEY, JSON.stringify(all)); } catch { /* ignore */ }
+      },
+      forUser(userId) { return this.read()[userId] ?? []; },
+      add(userId, gid) {
+        const all = this.read();
+        all[userId] = [...new Set([...(all[userId] ?? []), gid])];
+        this.write(all);
+      },
+      remove(userId, gids) {
+        if (!gids.length) return;
+        const all = this.read();
+        all[userId] = (all[userId] ?? []).filter((gid) => !gids.includes(gid));
+        this.write(all);
+      },
+      clear(userId) {
+        const all = this.read();
+        delete all[userId];
+        this.write(all);
+      },
+    };
+
+    /** A comparable summary of a schedule, so unchanged events keep their identity (and don't re-render). */
+    const fingerprint = (e) => JSON.stringify([
+      e.gid, e.title, e.date, e.start, e.end, Boolean(e.allDay), e.description ?? '', e.calendarId,
+      e.link ?? '', Boolean(e.readOnly), e.htmlLink ?? '', e.guests ?? [], e.attachments ?? [], e.gx ?? {},
+    ]);
+
+    /**
+     * Merge what Google returned (`remote`) into Taskly's list (`local`).
+     * Pure function: returns the SAME array when nothing changed.
+     *   - new in Google                  -> added
+     *   - changed in Google              -> updated (unless you have unsent edits)
+     *   - gone from Google (in the window) -> removed
+     *   - created/edited here, not sent yet -> left alone
+     */
+    function reconcileGoogleEvents(local, remote, { minKey, maxKey, tombstones }) {
+      const inWindow = (e) => e.date >= minKey && e.date < maxKey;
+      const byId = new Map(local.map((e) => [e.id, e]));
+      const byGid = new Map(local.filter((e) => e.gid && !e.readOnly).map((e) => [e.gid, e]));
+      const matched = new Set(); // ids of local events that Google also returned
+      const result = [];
+      let changed = false;
+
+      remote.forEach((incoming) => {
+        if (tombstones.has(incoming.gid)) return; // deleted here; Google will catch up
+        // Events made in Taskly have a UUID id but share Google's id in `gid`.
+        const twin = byId.get(incoming.id) ?? (incoming.readOnly ? undefined : byGid.get(incoming.gid));
+        if (!twin) { result.push(incoming); changed = true; return; }
+
+        matched.add(twin.id);
+        if (twin.dirty) { result.push(twin); return; } // unsent local edits win
+        const merged = { ...incoming, id: twin.id };
+        if (fingerprint(merged) === fingerprint(twin)) { result.push(twin); return; }
+        result.push(merged);
+        changed = true;
+      });
+
+      local.forEach((e) => {
+        if (matched.has(e.id)) return;
+        const deletedInGoogle = e.onGoogle && !e.dirty && inWindow(e);
+        if (deletedInGoogle) { changed = true; return; }
+        result.push(e);
+      });
+
+      return changed ? result : local;
+    }
+
+    /**
+     * The sync engine: one instance per app. Everything that talks to Google
+     * goes through a single queue, so requests never overlap or arrive out of
+     * order (e.g. a delete can't overtake the create before it).
+     */
+    function createCalendarSync({ store, toast }) {
+      const { getState, setState } = store;
+      let chain = Promise.resolve();
+      let running = false;
+      let lastRunAt = 0;
+      let covered = null;          // { userId, minKey, maxKey }: the date range the last pull loaded
+      let coverageQueued = false;
+
+      const enqueue = (task) => {
+        const run = chain.then(task);
+        chain = run.catch(() => {}); // a failed task must not block the queue
+        return run;
+      };
+      const currentUser = () => googleUserOf(getState());
+      const setStatus = (patch) => setState((s) => ({ gcal: { ...s.gcal, ...patch } }));
+      const needsSending = (e) => !e.readOnly && (e.dirty || !e.onGoogle);
+
+      /** Send one schedule to Google. Resolves with its Google id. */
+      async function pushOne(userId, event) {
+        const path = '/calendars/primary/events';
+        const query = { sendUpdates: CONFIG.GOOGLE_SEND_INVITES, supportsAttachments: 'true' };
+        const gid = event.gid ?? GoogleCalendar.idFor(event.id);
+        const update = () => GoogleCalendar.call(userId, `${path}/${encodeURIComponent(gid)}`,
+          { method: 'PATCH', query, body: GoogleCalendar.toBody(event, { patch: true }) });
+
+        if (event.onGoogle && gid) {
+          try { await update(); return gid; } catch (error) { if (error.status !== 404) throw error; }
+        }
+        try {
+          const created = await GoogleCalendar.call(userId, path, {
+            method: 'POST', query,
+            body: { ...GoogleCalendar.toBody(event, { patch: false }), ...(gid ? { id: gid } : {}) },
+          });
+          return created?.id ?? gid;
+        } catch (error) {
+          if (error.status === 409 && gid) { await update(); return gid; } // it already exists: update it instead
+          throw error;
+        }
+      }
+
+      /** Record that Google now has the event (and that there is nothing left to send, unless it changed meanwhile). */
+      function markSent(eventId, gid, rev) {
+        setState((s) => {
+          const target = s.events.find((e) => e.id === eventId);
+          if (!target) return {};
+          const untouched = target.rev === rev; // not edited again while the request was in flight
+          const updated = { ...target, gid, onGoogle: true, ...(untouched ? { dirty: false } : {}) };
+          return { events: s.events.map((e) => (e === target ? updated : e)) };
+        });
+      }
+
+      async function pushPending(userId) {
+        if (getState().activeUserId !== userId) return null;
+        let failure = null;
+        for (const event of getState().events.filter(needsSending)) {
+          if (getState().activeUserId !== userId) return failure;
+          try {
+            markSent(event.id, await pushOne(userId, event), event.rev);
+          } catch (error) {
+            if (error.code === 'auth') throw error;
+            failure = error; // keep going: one bad schedule shouldn't block the rest
+          }
+        }
+        return failure;
+      }
+
+      async function flushDeletes(userId) {
+        const done = [];
+        for (const gid of PendingDeletes.forUser(userId)) {
+          try {
+            await GoogleCalendar.call(userId, `/calendars/primary/events/${encodeURIComponent(gid)}`,
+              { method: 'DELETE', query: { sendUpdates: CONFIG.GOOGLE_SEND_INVITES } });
+            done.push(gid);
+          } catch (error) {
+            if (error.status === 404 || error.status === 410) { done.push(gid); continue; } // already gone
+            if (error.code === 'auth') { PendingDeletes.remove(userId, done); throw error; }
+            // Any other failure: keep it and try again on the next sync.
+          }
+        }
+        PendingDeletes.remove(userId, done);
+      }
+
+      /** Download the events around the month being viewed and merge them in. */
+      async function pullRemote(userId) {
+        const first = DateUtils.firstOfMonth(getState().currentDate);
+        const min = DateUtils.addMonthsClamped(first, -CONFIG.GOOGLE_SYNC_MONTHS_BEFORE);
+        const max = DateUtils.addMonthsClamped(first, CONFIG.GOOGLE_SYNC_MONTHS_AFTER + 1);
+
+        const items = [];
+        let pageToken;
+        do {
+          const page = await GoogleCalendar.call(userId, '/calendars/primary/events', {
+            query: {
+              singleEvents: 'true',   // list each occurrence of a repeating event separately
+              orderBy: 'startTime',
+              showDeleted: 'false',
+              supportsAttachments: 'true',
+              timeMin: min.toISOString(),
+              timeMax: max.toISOString(),
+              maxResults: '2500',
+              fields: 'nextPageToken,items(id,status,summary,description,location,hangoutLink,htmlLink,start,end,colorId,eventType,guestsCanModify,organizer(self),extendedProperties(private),attachments(fileId,fileUrl,title,mimeType,iconLink),attendees(email,responseStatus,self,resource,organizer))',
+              ...(pageToken ? { pageToken } : {}),
+            },
+          });
+          items.push(...(page.items ?? []));
+          pageToken = page.nextPageToken;
+        } while (pageToken && items.length < 10_000);
+
+        const state = getState();
+        if (state.activeUserId !== userId) return; // the user switched accounts while we waited
+        const validIds = new Set(Selectors.allCalendars(state).map((c) => c.id));
+        const remote = items.flatMap((item) => GoogleCalendar.fromEvent(item, validIds));
+        const range = { minKey: DateUtils.toKey(min), maxKey: DateUtils.toKey(max) };
+        const tombstones = new Set(PendingDeletes.forUser(userId));
+        covered = { userId, ...range };
+
+        setState((s) => {
+          if (s.activeUserId !== userId) return {};
+          const events = reconcileGoogleEvents(s.events, remote, { ...range, tombstones });
+          return events === s.events ? {} : { events };
+        });
+      }
+
+      function fail(userId, error, silent) {
+        if (getState().activeUserId !== userId) return;
+        if (error.code === 'auth') {
+          GoogleCalendarAuth.forget(userId);
+          setStatus({ status: 'off', message: 'Google Calendar disconnected. Reconnect to keep syncing.' });
+        } else {
+          setStatus({ status: 'error', message: explainGoogleError(error) });
+        }
+        if (!silent) toast(getState().gcal.message);
+      }
+
+      async function runSync(userId, { silent }) {
+        if (getState().activeUserId !== userId) return;
+        running = true;
+        try {
+          if (!silent) setStatus({ status: 'syncing', message: '' });
+          await flushDeletes(userId);
+          const pushFailure = await pushPending(userId);
+          await pullRemote(userId);
+          if (pushFailure) throw pushFailure;
+          if (getState().activeUserId === userId) setStatus({ status: 'synced', message: '', lastSync: Date.now() });
+          if (!silent) toast('Google Calendar is up to date');
+        } catch (error) {
+          fail(userId, error, silent);
+        } finally {
+          running = false;
+          lastRunAt = Date.now();
+        }
+      }
+
+      /** Push pending changes, then pull. `silent` = background poll (no spinner, no toast). */
+      function syncNow({ silent = false, force = false } = {}) {
+        const user = currentUser();
+        if (!user) return Promise.resolve();
+        if (!GoogleCalendarAuth.tokenFor(user.id)) {
+          if (getState().gcal.status !== 'off') {
+            setStatus({ status: 'off', message: 'Google Calendar session expired. Reconnect to keep syncing.' });
+          }
+          return Promise.resolve();
+        }
+        if (silent && !force && (running || Date.now() - lastRunAt < 5_000)) return Promise.resolve();
+        return enqueue(() => runSync(user.id, { silent }));
+      }
+
+      /** Open Google's permission popup (must run straight from a click), then sync. */
+      async function connect() {
+        const user = currentUser();
+        if (!user) return;
+        if (!GoogleAuth.isLoaded()) return toast('Google is still loading. Check your connection and try again.');
+        setStatus({ status: 'syncing', message: '' });
+        try {
+          await GoogleCalendarAuth.request(user);
+        } catch (error) {
+          setStatus({ status: 'off', message: error.cancelled ? '' : error.message });
+          if (!error.cancelled) toast(error.message);
+          return;
+        }
+        await syncNow();
+      }
+
+      function disconnect() {
+        const user = currentUser();
+        if (!user) return;
+        const token = GoogleCalendarAuth.tokenFor(user.id);
+        GoogleCalendarAuth.forget(user.id);
+        if (token && GoogleAuth.isLoaded()) google.accounts.oauth2.revoke(token, () => {});
+        setStatus({ status: 'off', message: '', lastSync: null });
+        toast('Disconnected from Google Calendar');
+      }
+
+      /** Called right after a schedule is saved. */
+      function pushSoon(eventId) {
+        const user = currentUser();
+        if (!user || !GoogleCalendarAuth.tokenFor(user.id)) return; // not connected: it goes up when they connect
+        enqueue(async () => {
+          const event = getState().events.find((e) => e.id === eventId);
+          if (!event || !needsSending(event)) return; // a sync already sent it
+          try {
+            markSent(event.id, await pushOne(user.id, event), event.rev);
+            toast('Saved to Google Calendar');
+          } catch (error) {
+            fail(user.id, error, true);
+            toast('Saved here, but not sent to Google Calendar yet. Taskly will retry.');
+          }
+        });
+      }
+
+      /** Called right after a schedule is deleted. */
+      function removeSoon(event) {
+        const user = currentUser();
+        const gid = event.gid ?? GoogleCalendar.idFor(event.id);
+        if (!user || !gid) return;
+        PendingDeletes.add(user.id, gid);
+        if (!GoogleCalendarAuth.tokenFor(user.id)) return; // it is removed the next time they connect
+        enqueue(async () => {
+          try {
+            await flushDeletes(user.id);
+            toast(PendingDeletes.forUser(user.id).includes(gid)
+              ? 'Deleted here. Google Calendar will catch up on the next sync.'
+              : 'Removed from Google Calendar');
+          } catch (error) {
+            fail(user.id, error, true);
+          }
+        });
+      }
+
+      /** Load more events when the user navigates beyond the months we already have. */
+      function ensureCoverage() {
+        const user = currentUser();
+        if (!user || !GoogleCalendarAuth.tokenFor(user.id) || coverageQueued) return;
+        const gridStart = DateUtils.startOfWeek(DateUtils.firstOfMonth(getState().currentDate));
+        const from = DateUtils.toKey(gridStart);
+        const to = DateUtils.toKey(DateUtils.addDays(gridStart, 42));
+        if (covered && covered.userId === user.id && from >= covered.minKey && to <= covered.maxKey) return;
+        coverageQueued = true;
+        enqueue(async () => {
+          coverageQueued = false;
+          await runSync(user.id, { silent: true });
+        });
+      }
+
+      /** The active account changed: start fresh and, if we hold a token for it, sync. */
+      function accountChanged() {
+        covered = null;
+        const user = currentUser();
+        const connected = Boolean(user && GoogleCalendarAuth.tokenFor(user.id));
+        setStatus({ status: connected ? 'syncing' : 'off', message: '', lastSync: null });
+        if (connected) syncNow({ silent: true, force: true });
+      }
+
+      /** Start the background triggers. Called once at launch. */
+      function start() {
+        const poll = () => { if (document.visibilityState === 'visible') syncNow({ silent: true }); };
+        setInterval(poll, CONFIG.GOOGLE_SYNC_INTERVAL_MS);
+        document.addEventListener('visibilitychange', poll);
+        window.addEventListener('focus', poll);
+
+        let lastKey = '';
+        store.subscribe((state) => {
+          const key = `${state.activeUserId}|${DateUtils.toKey(state.currentDate)}`;
+          if (key === lastKey) return;
+          lastKey = key;
+          ensureCoverage();
+        });
+      }
+
+      return { start, syncNow, connect, disconnect, pushSoon, removeSoon, accountChanged };
+    }
+
     function createActions(store) {
       const { getState, setState } = store;
       let toastCounter = 0;
       let toastTimer = null;
- 
+      const calendarSync = createCalendarSync({ store, toast: (message) => actions.showToast(message) });
+      const activeGoogleUser = () => googleUserOf(getState());
+
       const actions = {
         /* Navigation */
         navigate: (route) => setState({ activeRoute: route }),
@@ -506,7 +1678,7 @@
         },
         shiftMiniMonth: (direction) =>
           setState((s) => ({ miniMonth: DateUtils.addMonthsClamped(s.miniMonth, direction) })),
- 
+
         /* Sidebar */
         toggleAccount: (accountId) => setState((s) => ({
           accounts: s.accounts.map((a) => a.id === accountId ? { ...a, expanded: !a.expanded } : a),
@@ -517,12 +1689,12 @@
             calendars: a.calendars.map((c) => c.id === calendarId ? { ...c, visible: !c.visible } : c),
           }),
         })),
- 
+
         /* Schedule modal */
         openNewSchedule({ date, start } = {}) {
           const state = getState();
-          const nowMinutes = DateUtils.minutesSinceMidnight(state.now);
-          const startMinutes = start ?? Math.min(Math.ceil((nowMinutes + 1) / 60) * 60, 22 * 60);
+          const fallback = closestHalfHourRange(state.now);
+          const startMinutes = start ?? fallback.start;
           setState({
             modal: {
               mode: 'create',
@@ -532,8 +1704,11 @@
                 date: date ?? DateUtils.toKey(state.currentDate),
                 start: startMinutes,
                 end: Math.min(startMinutes + 60, 24 * 60),
+                allDay: false,
+                description: '',
                 calendarId: Selectors.allCalendars(state)[0]?.id ?? '',
                 guests: [],
+                attachments: [],
                 link: '',
               },
             },
@@ -541,23 +1716,130 @@
         },
         openEditSchedule: (event) => setState({ modal: { mode: 'edit', event } }),
         closeModal: () => setState({ modal: null }),
- 
+
         saveEvent(data) {
+          const mirrors = Boolean(activeGoogleUser()); // is there a Google calendar to keep in step?
+          let savedId = data.id;
           setState((s) => {
-            const isEdit = Boolean(data.id) && s.events.some((e) => e.id === data.id);
-            const events = isEdit
-              ? s.events.map((e) => (e.id === data.id ? { ...e, ...data } : e))
-              : [...s.events, { ...data, id: createId() }];
+            const existing = data.id ? s.events.find((e) => e.id === data.id) : undefined;
+            const id = existing?.id ?? createId();
+            savedId = id;
+            // `dirty` = changed here but not yet sent to Google (the sync engine clears it).
+            // `rev` lets the engine tell whether it was edited again while a request was in flight.
+            const saved = existing
+              ? { ...existing, ...data, id, dirty: mirrors || Boolean(existing.dirty), rev: (existing.rev ?? 0) + 1 }
+              : { ...data, id, gid: GoogleCalendar.idFor(id), onGoogle: false, dirty: mirrors, rev: 1 };
+            const events = existing ? s.events.map((e) => (e.id === id ? saved : e)) : [...s.events, saved];
             const savedDate = DateUtils.fromKey(data.date);
             return { events, modal: null, currentDate: savedDate, miniMonth: DateUtils.firstOfMonth(savedDate) };
           });
           actions.showToast('Schedule saved');
+          if (mirrors) calendarSync.pushSoon(savedId);
         },
         deleteEvent(eventId) {
+          const target = getState().events.find((e) => e.id === eventId);
           setState((s) => ({ events: s.events.filter((e) => e.id !== eventId), modal: null }));
           actions.showToast('Schedule deleted');
+          if (target && activeGoogleUser()) calendarSync.removeSoon(target);
         },
- 
+
+        /* Authentication */
+        openLogin: (mode = 'signin') =>
+          setState({ loginModal: { mode }, accountMenu: null, authError: '', authLoading: false }),
+        closeLogin: () => setState({ loginModal: null, authLoading: false, authError: '' }),
+        openAccountMenu: (position) => setState({ accountMenu: position }),
+        closeAccountMenu: () => setState({ accountMenu: null }),
+
+        async signInWithGoogle() {
+          if (!GoogleAuth.isConfigured()) {
+            return setState({ authError: 'Google sign-in needs a client ID. Add yours to CONFIG.GOOGLE_CLIENT_ID.' });
+          }
+          if (!GoogleAuth.isLoaded()) {
+            return setState({ authError: 'Google sign-in is still loading. Check your connection and try again.' });
+          }
+          setState({ authLoading: true, authError: '' });
+          try {
+            // requestProfile() runs synchronously up to the popup, so browsers
+            // treat it as a direct result of the click and don't block it.
+            const { profile, grant } = await GoogleAuth.requestProfile();
+            actions.completeSignIn(profile, grant);
+          } catch (error) {
+            setState({ authLoading: false, authError: error.cancelled ? '' : error.message });
+          }
+        },
+
+        /** For trying the UI without a Google client ID. */
+        signInDemo() {
+          const number = getState().users.filter((u) => u.demo).length + 1;
+          actions.completeSignIn({
+            id: `demo-${createId()}`, name: `Demo user ${number}`,
+            email: `demo${number}@example.com`, picture: '', demo: true,
+          });
+        },
+
+        completeSignIn(profile, grant) {
+          const wasKnown = getState().users.some((u) => u.id === profile.id);
+          setState((s) => {
+            const users = wasKnown
+              ? s.users.map((u) => (u.id === profile.id ? { ...u, ...profile } : u))
+              : [...s.users, profile];
+            return { ...buildSwitchPatch(s, users, profile.id), loginModal: null, authLoading: false, authError: '', accountMenu: null };
+          });
+          actions.showToast(wasKnown ? `Switched to ${profile.email}` : `Signed in as ${profile.email}`);
+          // The sign-in token already includes calendar access, so sync straight away.
+          if (grant?.calendar) GoogleCalendarAuth.remember(profile.id, grant.accessToken, grant.expiresIn);
+          calendarSync.accountChanged();
+        },
+
+        switchAccount(userId) {
+          const user = getState().users.find((u) => u.id === userId);
+          if (!user) return;
+          setState((s) => ({ ...buildSwitchPatch(s, s.users, userId), accountMenu: null }));
+          actions.showToast(`Switched to ${user.email}`);
+          calendarSync.accountChanged();
+        },
+
+        /** The quick-switch button: jump to the next signed-in account. */
+        cycleAccount() {
+          const { users, activeUserId } = getState();
+          if (users.length < 2) return;
+          const index = users.findIndex((u) => u.id === activeUserId);
+          actions.switchAccount(users[(index + 1) % users.length].id);
+        },
+
+        signOut(userId) {
+          const email = getState().users.find((u) => u.id === userId)?.email;
+          const wasActive = getState().activeUserId === userId;
+          GoogleCalendarAuth.forget(userId);
+          PendingDeletes.clear(userId);
+          setState((s) => {
+            const users = s.users.filter((u) => u.id !== userId);
+            const nextActive = s.activeUserId === userId ? (users[0]?.id ?? null) : s.activeUserId;
+            const patch = buildSwitchPatch(s, users, nextActive);
+            const { [userId]: _discarded, ...workspaces } = patch.workspaces; // drop their cached data
+            return { ...patch, workspaces, accountMenu: null };
+          });
+          actions.showToast(email ? `Signed out of ${email}` : 'Signed out');
+          if (wasActive) calendarSync.accountChanged();
+        },
+
+        /* Google Calendar */
+        connectGoogle: () => calendarSync.connect(),        // must run straight from a click (opens a popup)
+        disconnectGoogle: () => calendarSync.disconnect(),
+        syncGoogle: () => calendarSync.syncNow(),
+        /** The header button: sync when connected, otherwise start the connection. */
+        syncOrConnectGoogle() {
+          const user = activeGoogleUser();
+          if (!user) return undefined;
+          return GoogleCalendarAuth.tokenFor(user.id) ? calendarSync.syncNow() : calendarSync.connect();
+        },
+        startGoogleSync: () => calendarSync.start(),
+        /** Open Google Calendar events in Taskly's modal instead of redirecting externally. */
+        openInGoogle(event) {
+          // Open inside Taskly's schedule modal
+          actions.openEditSchedule(event);
+        },
+
         /* Feedback + time */
         showToast(message) {
           const id = ++toastCounter;
@@ -571,18 +1853,18 @@
       };
       return actions;
     }
- 
+
     /* ================================================================
        6. MODULE REGISTRY
        ================================================================
        A module is a plain object (see the how-to at the top). The
        registry handles the boring plumbing so modules stay small:
- 
+
          - finds (or creates) the slot element
          - calls `bind` ONCE   -> attach listeners with event delegation
          - subscribes to the store and calls `render` when `deps` change
          - shows/hides page modules that have a `route`
- 
+
        EVENT DELEGATION: we attach one listener to the slot and inspect
        `event.target.closest('[data-...]')`. Because the slot element
        itself is never replaced (only its innerHTML), listeners survive
@@ -591,7 +1873,7 @@
     */
     const ModuleRegistry = {
       modules: [],
- 
+
       register(...modules) {
         modules.forEach((mod) => {
           if (!mod.id || !mod.slot) throw new Error('A module needs an `id` and a `slot`.');
@@ -600,14 +1882,14 @@
         });
         return this;
       },
- 
+
       mountAll(ctx) {
         this.modules.forEach((mod) => this.mount(mod, ctx));
       },
- 
+
       mount(mod, ctx) {
         let el = document.querySelector(mod.slot);
- 
+
         // Modules can create their own slot (used by page modules).
         if (!el && mod.createIn) {
           el = document.createElement(mod.tag ?? 'section');
@@ -616,14 +1898,14 @@
           document.querySelector(mod.createIn)?.appendChild(el);
         }
         if (!el) { console.warn(`[registry] Slot not found for "${mod.id}": ${mod.slot}`); return; }
- 
+
         let previousDeps = null;
- 
+
         const update = (state) => {
           // `hidden` comes last in Tailwind's display utilities, so it wins over `flex`.
           if (mod.route) el.classList.toggle('hidden', state.activeRoute !== mod.route);
           if (!mod.render) return;
- 
+
           // Skip the render if none of the dependencies changed.
           const deps = mod.deps ? mod.deps(state) : [state];
           const unchanged = previousDeps
@@ -631,21 +1913,21 @@
             && deps.every((dep, i) => Object.is(dep, previousDeps[i]));
           if (unchanged) return;
           previousDeps = deps;
- 
+
           el.innerHTML = mod.render(state, ctx);
           mod.afterRender?.(el, state, ctx);
         };
- 
+
         mod.bind?.(el, ctx);
         ctx.store.subscribe(update);
         update(ctx.store.getState());
       },
     };
- 
+
     /* ================================================================
        7. MODULES
        ================================================================ */
- 
+
     /* ---------- 7.1 Navigation rail ---------- */
     const NAV_ITEMS = [
       { route: 'home',     label: 'Home',     icon: 'home' },
@@ -654,11 +1936,11 @@
       { route: 'timer',    label: 'Timer',    icon: 'timer' },
       { route: 'settings', label: 'Settings', icon: 'settings' },
     ];
- 
+
     const RailModule = {
       id: 'rail',
       slot: '#slot-rail',
-      deps: (s) => [s.activeRoute],
+      deps: (s) => [s.activeRoute, s.users, s.activeUserId],
       render(state) {
         const buttonBase = 'flex h-10 w-10 items-center justify-center rounded-full transition-colors';
         const navButtons = NAV_ITEMS.map((item) => {
@@ -670,45 +1952,269 @@
               ${icon(item.icon)}
             </button>`;
         }).join('');
- 
+
         return `
-          <div class="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-accent text-sm font-bold text-black" aria-hidden="true">Y</div>
+          <button type="button" data-open-account data-account-anchor aria-haspopup="menu"
+                  aria-label="${state.activeUserId ? 'Account menu' : 'Sign in'}" title="${state.activeUserId ? 'Account' : 'Sign in'}"
+                  class="shrink-0 rounded-full">
+            ${renderAvatar(Selectors.activeUser(state))}
+          </button>
           <div class="flex flex-row gap-2 md:flex-1 md:flex-col md:justify-center">${navButtons}</div>
           <div class="ml-auto flex flex-row gap-2 md:ml-0 md:flex-col">
             <button type="button" data-action="help" title="Help" aria-label="Help" class="${buttonBase} bg-surface-raised text-ink-muted hover:text-ink">${icon('help')}</button>
             <button type="button" data-action="logout" title="Log out" aria-label="Log out" class="${buttonBase} bg-surface-raised text-ink-muted hover:text-ink">${icon('logout')}</button>
           </div>`;
       },
-      bind(el, { actions }) {
+      bind(el, ctx) {
+        const { actions } = ctx;
         el.addEventListener('click', (e) => {
+          if (handleAccountTrigger(e.target, ctx)) return;
           const routeButton = e.target.closest('[data-route]');
           if (routeButton) return actions.navigate(routeButton.dataset.route);
- 
+
           const actionButton = e.target.closest('[data-action]');
           if (actionButton?.dataset.action === 'help') actions.showToast('Connect your help centre here.');
           if (actionButton?.dataset.action === 'logout') actions.showToast('Connect your sign-out flow here.');
         });
       },
     };
- 
-    /* ---------- 7.2 Workspace switcher ---------- */
+
+    /* ---------- 7.2 Account UI ----------
+       Three cooperating pieces share one slice of state:
+         a) WorkspaceModule   the "Taskly" card (sign-in button / account menu trigger)
+         b) AccountMenuModule the popup with switch / add / sign out
+         c) AuthModalModule   the blurred Google sign-in popup
+    */
+
+    const getInitials = (user) =>
+      (user.name || user.email).trim().split(/\s+/).slice(0, 2).map((part) => part[0]).join('').toUpperCase();
+
+    /** Profile photo if we have one, otherwise initials, otherwise a generic user icon. */
+    function renderAvatar(user, size = 'h-10 w-10') {
+      if (!user) {
+        return `<span class="flex ${size} shrink-0 items-center justify-center rounded-full bg-surface-raised text-ink-muted" aria-hidden="true">${icon('user')}</span>`;
+      }
+      if (user.picture) {
+        return `<img src="${esc(user.picture)}" alt="" referrerpolicy="no-referrer" class="${size} shrink-0 rounded-full object-cover" />`;
+      }
+      return `<span class="flex ${size} shrink-0 items-center justify-center rounded-full bg-accent text-sm font-bold text-black" aria-hidden="true">${esc(getInitials(user))}</span>`;
+    }
+
+    /**
+     * Shared click logic for anything that opens the account flow (the sidebar card
+     * AND the rail avatar, which is the only entry point on small screens).
+     * Returns true when the click was handled.
+     */
+    function handleAccountTrigger(target, { store, actions }) {
+      const trigger = target.closest('[data-open-account]');
+      if (!trigger) return false;
+
+      const state = store.getState();
+      if (!state.users.length) { actions.openLogin('signin'); return true; }
+      if (state.accountMenu) { actions.closeAccountMenu(); return true; }
+
+      // Position the popup under the element that was clicked, kept inside the viewport.
+      const anchor = trigger.closest('[data-account-anchor]') ?? trigger;
+      const rect = anchor.getBoundingClientRect();
+      const width = Math.min(CONFIG.ACCOUNT_MENU_WIDTH, window.innerWidth - 24);
+      const left = Math.max(12, Math.min(rect.left, window.innerWidth - width - 12));
+      actions.openAccountMenu({ top: rect.bottom + 8, left, width });
+      return true;
+    }
+
+    const LOGO_BOX = `
+      <span class="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-white" aria-hidden="true">
+        <svg viewBox="0 0 24 24" class="h-6 w-6" fill="none" stroke="#111" stroke-width="2.5"><path d="M12 3l7.8 4.5v9L12 21l-7.8-4.5v-9z"/><circle cx="12" cy="12" r="2.5" fill="#111"/></svg>
+      </span>`;
+
+    const GOOGLE_LOGO = `
+      <svg viewBox="0 0 48 48" class="h-5 w-5" aria-hidden="true">
+        <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/>
+        <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/>
+        <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/>
+        <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/>
+      </svg>`;
+
+    /* a) The "Taskly" card */
     const WorkspaceModule = {
       id: 'workspace',
       slot: '#slot-workspace',
-      deps: () => [], // static: renders once
-      render: () => `
-        <button type="button" class="flex w-full items-center gap-3 rounded-2xl bg-surface p-4 text-left">
-          <span class="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-white" aria-hidden="true">
-            <svg viewBox="0 0 24 24" class="h-6 w-6" fill="none" stroke="#111" stroke-width="2.5"><path d="M12 3l7.8 4.5v9L12 21l-7.8-4.5v-9z"/><circle cx="12" cy="12" r="2.5" fill="#111"/></svg>
-          </span>
-          <span class="min-w-0 flex-1">
-            <span class="block truncate text-base font-medium">Cronix Calendar</span>
-            <span class="block truncate text-sm text-ink-muted">My workspace</span>
-          </span>
-          <span class="text-ink-muted">${icon('chevronsUpDown', 'h-4 w-4')}</span>
-        </button>`,
+      deps: (s) => [s.users, s.activeUserId, s.accountMenu],
+      render(state) {
+        const user = Selectors.activeUser(state);
+
+        // Signed out: the whole card is a sign-in button.
+        if (!user) {
+          return `
+            <button type="button" data-open-account data-account-anchor
+                    class="flex w-full items-center gap-3 rounded-2xl bg-surface p-4 text-left transition-colors hover:bg-surface-raised">
+              <span class="min-w-0 flex-1">
+                <span class="block truncate text-base font-medium">Taskly</span>
+                <span class="block truncate text-sm text-ink-muted">Sign in with Google</span>
+              </span>
+              <span class="text-ink-muted">${icon('login', 'h-4 w-4')}</span>
+            </button>`;
+        }
+
+        // Signed in: opens the account menu. With 2+ accounts a quick-switch button appears on the right.
+        const firstName = (user.name || user.email).split(' ')[0];
+        const next = state.users[(state.users.findIndex((u) => u.id === user.id) + 1) % state.users.length];
+        const switchButton = state.users.length > 1 ? `
+          <button type="button" data-cycle-account aria-label="Switch to ${esc(next.email)}" title="Switch to ${esc(next.email)}"
+                  class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-line bg-surface-raised text-ink-muted transition-colors hover:text-ink">
+            ${icon('swap', 'h-4 w-4')}
+          </button>` : '';
+
+        return `
+          <div data-account-anchor class="flex items-center gap-2 rounded-2xl bg-surface p-4">
+            <button type="button" data-open-account aria-haspopup="menu" aria-expanded="${Boolean(state.accountMenu)}"
+                    class="flex min-w-0 flex-1 items-center gap-3 text-left">   
+              <span class="min-w-0 flex-1">
+                <span class="block truncate text-base font-medium">Taskly</span>
+                <span class="block truncate text-sm text-ink-muted">${esc(firstName)}'s workspace</span>
+              </span>
+              <span class="text-ink-muted">${icon('chevronsUpDown', 'h-4 w-4')}</span>
+            </button>
+            ${switchButton}
+          </div>`;
+      },
+      bind(el, ctx) {
+        el.addEventListener('click', (e) => {
+          if (e.target.closest('[data-cycle-account]')) return ctx.actions.cycleAccount();
+          handleAccountTrigger(e.target, ctx);
+        });
+      },
     };
- 
+
+    /* b) The account popup (switch / add / sign out) */
+    const AccountMenuModule = {
+      id: 'account-menu',
+      slot: '#slot-account-menu',
+      deps: (s) => [s.accountMenu, s.users, s.activeUserId],
+      render(state) {
+        if (!state.accountMenu) return '';
+        const { top, left, width } = state.accountMenu;
+        const active = Selectors.activeUser(state);
+        if (!active) return '';
+        const multiple = state.users.length > 1;
+
+        const rowBase = 'flex w-full items-center gap-3 rounded-xl px-2 py-2 text-left';
+        const identity = (user) => `
+          ${renderAvatar(user, 'h-9 w-9')}
+          <span class="min-w-0 flex-1">
+            <span class="block truncate text-sm font-medium">${esc(user.name || user.email)}</span>
+            <span class="block truncate text-xs text-ink-muted">${esc(user.email)}</span>
+          </span>`;
+
+        // 2+ accounts: a list to switch between. 1 account: just show who is signed in.
+        const accountSection = multiple ? `
+          <p class="px-2 pb-1 pt-1 text-xs text-ink-muted">Switch account</p>
+          <ul class="flex flex-col gap-0.5">
+            ${state.users.map((user) => {
+              const isActive = user.id === active.id;
+              return `
+                <li>
+                  <button type="button" role="menuitemradio" aria-checked="${isActive}" data-switch-user="${esc(user.id)}"
+                          class="${rowBase} transition-colors ${isActive ? 'bg-white/[0.07]' : 'hover:bg-white/5'}">
+                    ${identity(user)}
+                    ${isActive ? `<span class="text-accent">${icon('check', 'h-4 w-4')}</span>` : ''}
+                  </button>
+                </li>`;
+            }).join('')}
+          </ul>` : `<div class="${rowBase}">${identity(active)}</div>`;
+
+        const actionIcon = (name) => `<span class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-surface-raised text-ink-muted">${icon(name, 'h-4 w-4')}</span>`;
+
+        return `
+          <div data-menu-backdrop class="fixed inset-0 z-40"></div>
+          <div role="menu" aria-label="Account menu"
+               class="fixed z-50 rounded-2xl border border-line bg-surface p-2 shadow-2xl"
+               style="top:${top}px;left:${left}px;width:${width}px">
+            ${accountSection}
+            <div class="my-2 border-t border-line"></div>
+            <button type="button" role="menuitem" data-add-account class="${rowBase} text-sm transition-colors hover:bg-white/5">
+              ${actionIcon('plus')} Add account
+            </button>
+            <button type="button" role="menuitem" data-sign-out="${esc(active.id)}" class="${rowBase} text-sm transition-colors hover:bg-white/5">
+              ${actionIcon('logout')} <span class="min-w-0 flex-1 truncate">Sign out</span>
+            </button>
+          </div>`;
+      },
+      afterRender(el) {
+        // Move keyboard focus into the popup so arrow/Tab users land in it.
+        el.querySelector('[role="menu"] button')?.focus();
+      },
+      bind(el, { actions }) {
+        el.addEventListener('click', (e) => {
+          if (e.target.matches('[data-menu-backdrop]')) return actions.closeAccountMenu();
+
+          const switchButton = e.target.closest('[data-switch-user]');
+          if (switchButton) return actions.switchAccount(switchButton.dataset.switchUser);
+
+          if (e.target.closest('[data-add-account]')) return actions.openLogin('add');
+
+          const signOutButton = e.target.closest('[data-sign-out]');
+          if (signOutButton) actions.signOut(signOutButton.dataset.signOut);
+        });
+      },
+    };
+
+    /* c) The sign-in popup: same card style as the schedule modal, with a blurred backdrop */
+    const AuthModalModule = {
+      id: 'auth-modal',
+      slot: '#slot-auth-modal',
+      deps: (s) => [s.loginModal, s.authLoading, s.authError],
+      render(state) {
+        if (!state.loginModal) return '';
+        const isAdd = state.loginModal.mode === 'add';
+        const configured = GoogleAuth.isConfigured();
+
+        const demoSection = configured ? '' : `
+          <div class="mt-5 rounded-xl border border-dashed border-line p-4 text-xs leading-relaxed text-ink-muted">
+            Google sign-in isn't set up yet. Add your OAuth client ID to
+            <code class="text-ink">CONFIG.GOOGLE_CLIENT_ID</code>, or try the app with a demo account.
+          </div>
+          <button type="button" data-demo-signin
+                  class="mt-3 w-full rounded-xl border border-line px-5 py-3 text-sm transition-colors hover:bg-white/5">
+            Continue in demo mode
+          </button>`;
+
+        return `
+          <div data-auth-overlay class="fixed inset-0 z-[55] flex items-center justify-center overflow-y-auto bg-black/60 p-4 backdrop-blur-md">
+            <div role="dialog" aria-modal="true" aria-labelledby="auth-heading"
+                 class="relative my-auto w-full max-w-sm rounded-3xl border border-line bg-surface p-6 shadow-2xl">
+              <button type="button" data-close-auth aria-label="Close"
+                      class="absolute right-5 top-5 rounded-full p-1 text-ink-muted hover:text-ink">${icon('close')}</button>
+              <h2 id="auth-heading" class="mt-5 text-3xl">${isAdd ? 'Add account' : 'Sign in'}</h2>
+              <p class="mt-2 text-sm text-ink-muted">
+                ${isAdd
+                  ? 'Choose another Google account. You can switch between your accounts at any time.'
+                  : 'Continue with your Google account to open your calendar workspace and sync it with Google Calendar.'}
+              </p>
+
+              <button type="button" data-google-signin ${state.authLoading ? 'disabled' : ''}
+                      class="mt-6 flex w-full items-center justify-center gap-3 rounded-xl bg-white px-5 py-3 text-sm font-medium text-black transition-colors hover:bg-white/90 disabled:opacity-60">
+                ${GOOGLE_LOGO}
+                ${state.authLoading ? 'Waiting for Google…' : 'Continue with Google'}
+              </button>
+
+              <p role="alert" class="mt-3 min-h-5 text-sm text-red-400">${esc(state.authError)}</p>
+              ${demoSection}
+            </div>
+          </div>`;
+      },
+      afterRender(el) {
+        el.querySelector('[data-google-signin]')?.focus();
+      },
+      bind(el, { actions }) {
+        el.addEventListener('click', (e) => {
+          if (e.target.closest('[data-close-auth]') || e.target.matches('[data-auth-overlay]')) return actions.closeLogin();
+          if (e.target.closest('[data-google-signin]')) return actions.signInWithGoogle();
+          if (e.target.closest('[data-demo-signin]')) actions.signInDemo();
+        });
+      },
+    };
+
     /* ---------- 7.3 Mini calendar ---------- */
     const MiniCalendarModule = {
       id: 'mini-calendar',
@@ -720,10 +2226,10 @@
         const todayKey = DateUtils.toKey(state.now);
         const selectedWeekKey = DateUtils.toKey(DateUtils.startOfWeek(state.currentDate));
         const weekdayLabels = ['Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa', 'Su'];
- 
+
         const weeks = Array.from({ length: 6 }, (_, w) =>
           Array.from({ length: 7 }, (_, d) => DateUtils.addDays(gridStart, w * 7 + d)));
- 
+
         const rows = weeks.map((week) => {
           const inSelectedWeek = DateUtils.toKey(week[0]) === selectedWeekKey;
           const cells = week.map((date) => {
@@ -741,7 +2247,7 @@
           }).join('');
           return `<div class="grid grid-cols-7 rounded-xl py-0.5 ${inSelectedWeek ? 'bg-white/[0.07]' : ''}">${cells}</div>`;
         }).join('');
- 
+
         return `
           <section class="rounded-2xl bg-surface p-4" aria-label="Month navigator">
             <div class="mb-3 flex items-center justify-between">
@@ -759,13 +2265,13 @@
         el.addEventListener('click', (e) => {
           const shiftButton = e.target.closest('[data-mini-shift]');
           if (shiftButton) return actions.shiftMiniMonth(Number(shiftButton.dataset.miniShift));
- 
+
           const dayButton = e.target.closest('[data-date]');
           if (dayButton) actions.selectDate(DateUtils.fromKey(dayButton.dataset.date));
         });
       },
     };
- 
+
     /* ---------- 7.4 Calendar accounts ---------- */
     const AccountsModule = {
       id: 'accounts',
@@ -786,7 +2292,7 @@
                   </button>
                 </li>`).join('')}
             </ul>` : '';
- 
+
           return `
             <div class="rounded-2xl bg-surface p-4">
               <button type="button" data-toggle-account="${esc(account.id)}" aria-expanded="${account.expanded}"
@@ -797,7 +2303,7 @@
               ${calendars}
             </div>`;
         }).join('');
- 
+
         return `
           ${accountCards}
           <button type="button" data-action="add-account"
@@ -809,20 +2315,94 @@
         el.addEventListener('click', (e) => {
           const accountToggle = e.target.closest('[data-toggle-account]');
           if (accountToggle) return actions.toggleAccount(accountToggle.dataset.toggleAccount);
- 
+
           const calendarToggle = e.target.closest('[data-calendar]');
           if (calendarToggle) return actions.toggleCalendar(calendarToggle.dataset.account, calendarToggle.dataset.calendar);
- 
+
           if (e.target.closest('[data-action="add-account"]')) actions.showToast('Connect your account-linking flow here.');
         });
       },
     };
- 
+
+    /* ---------- 7.4b Google Calendar sync card ----------
+       Sits above the calendar list. Shows whether Taskly is connected to the
+       user's Google Calendar and lets them connect, sync now, or disconnect. */
+    const GoogleSyncModule = {
+      id: 'google-sync',
+      slot: '#slot-gcal',
+      deps: (s) => [s.gcal, s.users, s.activeUserId],
+      render(state) {
+        const user = Selectors.activeUser(state);
+        const { status, message, lastSync } = state.gcal;
+
+        const card = (inner) => `<section class="rounded-2xl bg-surface p-4" aria-label="Google Calendar sync">${inner}</section>`;
+        const heading = (dot = '') => `
+          <div class="flex items-center gap-3">
+            <span class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-surface-raised">${GOOGLE_LOGO}</span>
+            <span class="min-w-0 flex-1 truncate text-sm font-medium">Google Calendar</span>
+            ${dot}
+          </div>`;
+        const note = (text, tone = 'text-ink-muted') => `<p class="mt-3 text-xs leading-relaxed ${tone}">${esc(text)}</p>`;
+        const button = 'rounded-xl border border-line bg-surface-raised px-3 py-2 text-sm transition-colors hover:bg-white/10';
+
+        if (!user) {
+          return card(`
+            ${heading()}
+            ${note('Sign in with Google to add your schedules to Google Calendar.')}
+            <button type="button" data-gcal="signin" class="mt-3 w-full ${button}">Sign in with Google</button>`);
+        }
+        if (user.demo) {
+          return card(`${heading()}${note("Demo accounts can't sync. Sign in with a Google account to use Google Calendar.")}`);
+        }
+
+        if (status === 'off') {
+          return card(`
+            ${heading()}
+            ${note('Schedules you add here also appear in Google Calendar, and changes made there show up in Taskly.')}
+            ${message ? `<p role="alert" class="mt-2 text-xs leading-relaxed text-red-400">${esc(message)}</p>` : ''}
+            <button type="button" data-gcal="connect"
+                    class="mt-3 flex w-full items-center justify-center gap-2 rounded-xl bg-white px-4 py-2.5 text-sm font-medium text-black transition-colors hover:bg-white/90">
+              ${message ? 'Reconnect' : 'Connect'} Google Calendar
+            </button>`);
+        }
+
+        const syncing = status === 'syncing';
+        const dotTone = status === 'error' ? 'bg-red-400' : (syncing ? 'bg-ink-faint animate-pulse' : 'bg-accent');
+        const line = status === 'error'
+          ? note(message, 'text-red-400')
+          : note(syncing
+            ? 'Syncing…'
+            : (lastSync ? `Synced at ${DateUtils.formatTime(DateUtils.minutesSinceMidnight(new Date(lastSync)))}` : 'Connected'));
+
+        return card(`
+          ${heading(`<span class="h-2 w-2 shrink-0 rounded-full ${dotTone}" aria-hidden="true"></span>`)}
+          <div role="status">${line}</div>
+          <div class="mt-3 flex gap-2">
+            <button type="button" data-gcal="sync" ${syncing ? 'disabled' : ''}
+                    class="flex flex-1 items-center justify-center gap-2 ${button} disabled:opacity-60">
+              ${icon('refresh', `h-4 w-4 ${syncing ? 'animate-spin' : ''}`)} Sync now
+            </button>
+            <button type="button" data-gcal="disconnect" class="${button} text-ink-muted hover:text-ink">Disconnect</button>
+          </div>`);
+      },
+      bind(el, { actions }) {
+        el.addEventListener('click', (e) => {
+          const button = e.target.closest('[data-gcal]');
+          if (!button) return;
+          const kind = button.dataset.gcal;
+          if (kind === 'signin') actions.openLogin('signin');
+          if (kind === 'connect') actions.connectGoogle();   // opens Google's popup, so it must run straight from the click
+          if (kind === 'sync') actions.syncGoogle();
+          if (kind === 'disconnect') actions.disconnectGoogle();
+        });
+      },
+    };
+
     /* ---------- 7.5 Calendar header ---------- */
     const CalendarHeaderModule = {
       id: 'calendar-header',
       slot: '#slot-calendar-header',
-      deps: (s) => [s.currentDate, s.view],
+      deps: (s) => [s.currentDate, s.view, s.gcal, s.users, s.activeUserId],
       render(state) {
         // View buttons are generated from the CalendarViews registry.
         const viewButtons = Object.entries(CalendarViews).map(([id, view]) => {
@@ -833,18 +2413,30 @@
               ${esc(view.label)}
             </button>`;
         }).join('');
- 
+
         const roundButton = 'flex h-9 w-9 items-center justify-center rounded-full border border-line bg-surface-raised text-ink-muted hover:text-ink';
- 
+
+        // Google Calendar sync button: only for real Google accounts. Lime = "connect me", red = last sync failed.
+        const { status } = state.gcal;
+        const syncLabel = status === 'off' ? 'Connect Google Calendar' : 'Sync with Google Calendar';
+        const syncTone = status === 'off' ? 'border-accent/60 text-accent'
+          : (status === 'error' ? 'border-red-400/60 text-red-400' : 'border-line text-ink-muted hover:text-ink');
+        const syncButton = GoogleCalendar.eligible(Selectors.activeUser(state)) ? `
+          <button type="button" data-action="sync" aria-label="${syncLabel}" title="${syncLabel}"
+                  class="flex h-9 w-9 items-center justify-center rounded-full border bg-surface-raised ${syncTone}">
+            ${icon('refresh', `h-4 w-4 ${status === 'syncing' ? 'animate-spin' : ''}`)}
+          </button>` : '';
+
         return `
           <div class="flex flex-wrap items-center gap-3 p-4 sm:p-5">
-            <h1 class="mr-2 text-2xl">${DateUtils.formatMonthYear(state.currentDate)}</h1>
             <button type="button" data-action="today" class="rounded-xl border border-line bg-surface-raised px-4 py-2 text-sm hover:bg-white/10">Today</button>
             <div class="flex gap-1">
               <button type="button" data-shift="-1" aria-label="Previous" class="${roundButton}">${icon('chevronLeft', 'h-4 w-4')}</button>
               <button type="button" data-shift="1" aria-label="Next" class="${roundButton}">${icon('chevronRight', 'h-4 w-4')}</button>
             </div>
+            <h1 class="mr-2 text-2xl">${DateUtils.formatMonthYear(state.currentDate)}</h1>
             <div class="ml-auto flex items-center gap-3">
+              ${syncButton}
               <div role="group" aria-label="Calendar view" class="flex rounded-xl bg-surface-sunken p-1 text-sm">${viewButtons}</div>
               <button type="button" data-action="new"
                       class="flex items-center gap-2 rounded-xl bg-accent px-4 py-2 text-sm font-medium text-black hover:brightness-95">
@@ -857,19 +2449,20 @@
         el.addEventListener('click', (e) => {
           const viewButton = e.target.closest('[data-view]');
           if (viewButton) return actions.setView(viewButton.dataset.view);
- 
+
           const shiftButton = e.target.closest('[data-shift]');
           if (shiftButton) return actions.shift(Number(shiftButton.dataset.shift));
- 
+
           const actionButton = e.target.closest('[data-action]');
           if (actionButton?.dataset.action === 'today') actions.goToToday();
           if (actionButton?.dataset.action === 'new') actions.openNewSchedule();
+          if (actionButton?.dataset.action === 'sync') actions.syncOrConnectGoogle();
         });
       },
     };
- 
+
     /* ---------- 7.6 Calendar body (renders the active view) ---------- */
- 
+
     /** One timed event block inside a day column. */
     function renderTimedEvent({ event, lane, lanes }, calendar) {
       const H = CONFIG.HOUR_HEIGHT;
@@ -877,8 +2470,8 @@
       const height = Math.max(((event.end - event.start) / 60) * H, 24);
       const width = 100 / lanes;
       const compact = height < 52;
-      const range = `${DateUtils.formatTime(event.start)} - ${DateUtils.formatTime(event.end)}`;
- 
+      const range = DateUtils.formatRange(event);
+
       return `
         <button type="button" data-event-id="${esc(event.id)}"
                 aria-label="${esc(event.title)}, ${range}"
@@ -888,7 +2481,7 @@
           ${compact ? '' : `<span class="mt-1 block opacity-70">${range}</span>`}
         </button>`;
     }
- 
+
     /** Shared by Day and Week: a sticky header row + hour grid. */
     function renderTimeGrid(state, days) {
       const H = CONFIG.HOUR_HEIGHT;
@@ -899,7 +2492,7 @@
       const todayKey = DateUtils.toKey(state.now);
       const nowMinutes = DateUtils.minutesSinceMidnight(state.now);
       const showNow = days.some((d) => DateUtils.toKey(d) === todayKey);
- 
+
       const headerCells = days.map((date) => {
         const key = DateUtils.toKey(date);
         const isToday = key === todayKey;
@@ -909,23 +2502,39 @@
             ${DateUtils.formatWeekdayShort(date)} ${date.getDate()}
           </button>`;
       }).join('');
- 
+
       const hourLabels = Array.from({ length: 23 }, (_, i) => i + 1).map((hour) =>
         `<span class="absolute right-2 -translate-y-1/2 text-xs text-ink-muted" style="top:${hour * H}px">${DateUtils.formatTime(hour * 60)}</span>`
       ).join('');
- 
+
       const nowChip = showNow
         ? `<span class="absolute right-1 z-10 -translate-y-1/2 rounded-md bg-surface-raised px-1.5 py-0.5 text-[11px] ring-1 ring-line" style="top:${(nowMinutes / 60) * H}px">${DateUtils.formatTime(nowMinutes)}</span>`
         : '';
- 
+
+      // All-day events sit in a strip under the day headers instead of blocking the whole column.
+      const hasAllDay = days.some((d) => (byDate.get(DateUtils.toKey(d)) ?? []).some((e) => e.allDay));
+      const allDayCells = days.map((date) => {
+        const pills = (byDate.get(DateUtils.toKey(date)) ?? []).filter((e) => e.allDay).map((event) => `
+          <button type="button" data-event-id="${esc(event.id)}" aria-label="${esc(event.title)}, all day"
+                  class="block w-full truncate rounded-md px-1.5 py-0.5 text-left text-[11px] font-medium hover:brightness-110"
+                  style="background:${esc(calendars.get(event.calendarId)?.color ?? '#888')};color:${CONFIG.EVENT_TEXT_COLOR}">${esc(event.title)}</button>`).join('');
+        return `<div class="flex flex-col gap-1 border-l border-line p-1">${pills}</div>`;
+      }).join('');
+      const allDayRow = hasAllDay
+        ? `<div class="grid border-b border-line bg-surface-raised" style="grid-template-columns:${columns}">
+             <div class="sticky left-0 z-10 flex items-start justify-center bg-surface-raised px-1 pt-2 text-[11px] text-ink-muted">All day</div>
+             ${allDayCells}
+           </div>`
+        : '';
+
       const dayColumns = days.map((date) => {
         const key = DateUtils.toKey(date);
         const isToday = key === todayKey;
-        const events = layoutOverlaps(byDate.get(key) ?? [])
+        const events = layoutOverlaps((byDate.get(key) ?? []).filter((e) => !e.allDay))
           .map((item) => renderTimedEvent(item, calendars.get(item.event.calendarId))).join('');
         const nowLine = isToday
           ? `<div class="pointer-events-none absolute inset-x-0 z-10 h-px bg-white" style="top:${(nowMinutes / 60) * H}px"></div>` : '';
- 
+
         // The hour lines are a CSS gradient: one element instead of 24 divs.
         return `
           <div data-column-date="${key}" class="relative border-l border-line ${isToday ? 'bg-white/[0.02]' : ''}"
@@ -933,12 +2542,15 @@
             ${events}${nowLine}
           </div>`;
       }).join('');
- 
+
       return `
         <div style="min-width:${minWidth}">
-          <div class="sticky top-0 z-30 grid border-b border-line bg-surface-raised" style="grid-template-columns:${columns}">
-            <div class="sticky left-0 z-10 flex items-center justify-center bg-surface-raised px-2 text-xs text-ink-muted">${DateUtils.gmtLabel()}</div>
-            ${headerCells}
+          <div class="sticky top-0 z-30 bg-surface-raised">
+            <div class="grid border-b border-line" style="grid-template-columns:${columns}">
+              <div class="sticky left-0 z-10 flex items-center justify-center bg-surface-raised px-2 text-xs text-ink-muted">${DateUtils.gmtLabel()}</div>
+              ${headerCells}
+            </div>
+            ${allDayRow}
           </div>
           <div class="relative grid" style="grid-template-columns:${columns};height:${24 * H}px">
             <div class="sticky left-0 z-20 bg-surface">${hourLabels}${nowChip}</div>
@@ -946,7 +2558,7 @@
           </div>
         </div>`;
     }
- 
+
     function renderMonth(state) {
       const calendars = Selectors.calendarMap(state);
       const byDate = Selectors.eventsByDate(state);
@@ -954,10 +2566,10 @@
       const todayKey = DateUtils.toKey(state.now);
       const days = Array.from({ length: 42 }, (_, i) => DateUtils.addDays(gridStart, i));
       const MAX_VISIBLE = 3;
- 
+
       const weekdayHeader = days.slice(0, 7).map((d) =>
         `<div class="border-l border-line py-3 text-center text-sm text-ink-muted first:border-l-0">${DateUtils.formatWeekdayShort(d)}</div>`).join('');
- 
+
       const cells = days.map((date) => {
         const key = DateUtils.toKey(date);
         const inMonth = date.getMonth() === state.currentDate.getMonth();
@@ -971,7 +2583,7 @@
         const overflow = events.length > MAX_VISIBLE
           ? `<button type="button" data-goto-day="${key}" class="text-[11px] text-ink-muted hover:text-ink">+${events.length - MAX_VISIBLE} more</button>` : '';
         const dayTone = key === todayKey ? 'bg-accent font-medium text-black' : (inMonth ? 'text-ink' : 'text-ink-faint');
- 
+
         return `
           <div data-cell-date="${key}" class="cursor-pointer border-b border-l border-line p-1.5 hover:bg-white/[0.03] ${inMonth ? '' : 'bg-black/20'}">
             <button type="button" data-goto-day="${key}" aria-label="Open ${DateUtils.formatLong(date)}"
@@ -979,14 +2591,14 @@
             ${pills}${overflow}
           </div>`;
       }).join('');
- 
+
       return `
         <div class="flex min-h-full flex-col" style="min-width:640px">
           <div class="sticky top-0 z-30 grid grid-cols-7 border-b border-line bg-surface-raised">${weekdayHeader}</div>
           <div class="grid flex-1 grid-cols-7" style="grid-auto-rows:minmax(6.5rem,1fr)">${cells}</div>
         </div>`;
     }
- 
+
     registerCalendarView('day', {
       label: 'Day',
       render: (state) => renderTimeGrid(state, [state.currentDate]),
@@ -1002,10 +2614,10 @@
       render: renderMonth,
       shift: (date, dir) => DateUtils.addMonthsClamped(date, dir),
     });
- 
+
     const CalendarBodyModule = (() => {
       let lastView = null; // remembered so we only reset scroll when the view changes
- 
+
       return {
         id: 'calendar-body',
         slot: '#slot-calendar-body',
@@ -1023,13 +2635,14 @@
             const eventButton = e.target.closest('[data-event-id]');
             if (eventButton) {
               const found = store.getState().events.find((ev) => ev.id === eventButton.dataset.eventId);
+              // Open all events (including readOnly Google Calendar events) in the Taskly schedule modal
               if (found) actions.openEditSchedule(found);
               return;
             }
- 
+
             const dayButton = e.target.closest('[data-goto-day]');
             if (dayButton) return actions.showDay(DateUtils.fromKey(dayButton.dataset.gotoDay));
- 
+
             // Clicking empty space in a time column creates an event at that time.
             const column = e.target.closest('[data-column-date]');
             if (column) {
@@ -1037,36 +2650,165 @@
               const snapped = Math.floor(((y / CONFIG.HOUR_HEIGHT) * 60) / CONFIG.SNAP_MINUTES) * CONFIG.SNAP_MINUTES;
               return actions.openNewSchedule({ date: column.dataset.columnDate, start: Math.min(snapped, 23 * 60 + 30) });
             }
- 
+
             const cell = e.target.closest('[data-cell-date]');
             if (cell) actions.openNewSchedule({ date: cell.dataset.cellDate, start: 9 * 60 });
           });
         },
       };
     })();
- 
+
     /* ---------- 7.7 Schedule modal (create / edit) ---------- */
     const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
- 
+
     const renderGuestChip = (email) => `
       <span data-guest="${esc(email)}" class="inline-flex items-center gap-1 rounded-md bg-white/10 py-1 pl-2 pr-1 text-xs">
         ${esc(email)}
         <button type="button" data-remove-guest aria-label="Remove ${esc(email)}" class="rounded p-0.5 text-ink-muted hover:text-ink">${icon('close', 'h-3 w-3')}</button>
       </span>`;
- 
-    function renderTimeOptions(selected, min, max) {
-      const values = [];
-      for (let m = min; m <= max; m += CONFIG.SNAP_MINUTES) values.push(m);
-      if (!values.includes(selected)) { values.push(selected); values.sort((a, b) => a - b); }
-      return values.map((m) => `<option value="${m}" ${m === selected ? 'selected' : ''}>${DateUtils.formatTime(m)}</option>`).join('');
+
+    /* Time picker: a text input plus a scrollable list of every 15 minutes. */
+    const TIME_STEP = 15;
+    const TIME_ERROR = 'Enter a valid time, like 4:30 pm or 16:30.';
+    const DATE_ERROR = 'Enter a valid date, like Sep 29 or 9/29.';
+    const TIME_LIST_HTML = Array.from({ length: (24 * 60) / TIME_STEP }, (_, i) => {
+      const m = i * TIME_STEP;
+      return `<div role="option" id="time-opt-__NAME__-${m}" data-time-option="${m}" aria-selected="false"
+                   class="cursor-pointer px-4 py-2 text-sm text-ink data-[active]:bg-white/10 data-[selected]:font-medium data-[selected]:text-accent">${DateUtils.formatTimeField(m)}</div>`;
+    }).join('');
+
+    /** One time field. `name` is 'start' or 'end'. */
+    const renderTimeField = (name, label, minutes, withIcon, disabled) => `
+      <div data-time-field="${name}" class="relative">
+        <div class="flex items-center gap-3 rounded-xl border border-line bg-surface-sunken px-4 py-3 transition-colors focus-within:border-accent/70 has-[[aria-invalid=true]]:border-red-400/70 has-[:disabled]:opacity-40">
+          ${withIcon ? `<span class="shrink-0 text-ink-muted">${icon('clock', 'h-4 w-4')}</span>` : ''}
+          <input name="${name}" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" maxlength="12"
+                 value="${DateUtils.formatTimeField(minutes)}" placeholder="hh:mm" aria-label="${label}" ${disabled ? 'disabled' : ''}
+                 role="combobox" aria-expanded="false" aria-autocomplete="none" aria-controls="time-list-${name}"
+                 class="w-full min-w-0 bg-transparent text-sm tabular-nums outline-none placeholder:text-ink-faint disabled:cursor-not-allowed" />
+        </div>
+        <div id="time-list-${name}" role="listbox" aria-label="${label} options" hidden
+             class="absolute left-0 top-full z-20 mt-1.5 max-h-52 w-full min-w-[7.5rem] overflow-y-auto overscroll-contain rounded-xl border border-line bg-surface-raised py-1.5 shadow-2xl shadow-black/60">
+          ${TIME_LIST_HTML.replaceAll('__NAME__', name)}
+        </div>
+      </div>`;
+
+    const CALENDAR_WEEKDAYS = ['Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa', 'Su'];
+
+    /** The date dropdown: a month grid styled like the sidebar mini calendar. */
+    function renderDatePanel(viewMonth, selectedKey, todayKey) {
+      const gridStart = DateUtils.startOfWeek(viewMonth);
+      const days = Array.from({ length: 42 }, (_, i) => DateUtils.addDays(gridStart, i)).map((date) => {
+        const key = DateUtils.toKey(date);
+        const inMonth = date.getMonth() === viewMonth.getMonth();
+        let tone = inMonth ? 'text-ink hover:bg-white/10' : 'text-ink-faint hover:bg-white/10';
+        if (key === todayKey) tone = 'font-medium text-accent hover:bg-white/10';
+        if (key === selectedKey) tone = 'bg-white font-medium text-black';
+        return `
+          <button type="button" tabindex="-1" data-cal-day="${key}" aria-label="${DateUtils.formatLong(date)}" aria-pressed="${key === selectedKey}"
+                  class="mx-auto flex h-9 w-9 items-center justify-center rounded-full text-[13px] transition-colors ${tone}">${date.getDate()}</button>`;
+      }).join('');
+
+      return `
+        <div class="mb-2 flex items-center justify-between px-1">
+          <h3 class="text-sm font-medium">${DateUtils.formatMonthYear(viewMonth)}</h3>
+          <div class="flex gap-1">
+            <button type="button" tabindex="-1" data-cal-shift="-1" aria-label="Previous month" class="rounded-full p-1.5 text-ink-muted transition-colors hover:bg-white/10 hover:text-ink">${icon('chevronLeft', 'h-4 w-4')}</button>
+            <button type="button" tabindex="-1" data-cal-shift="1" aria-label="Next month" class="rounded-full p-1.5 text-ink-muted transition-colors hover:bg-white/10 hover:text-ink">${icon('chevronRight', 'h-4 w-4')}</button>
+          </div>
+        </div>
+        <div class="mb-1 grid grid-cols-7 text-center text-xs text-ink-muted" aria-hidden="true">
+          ${CALENDAR_WEEKDAYS.map((label) => `<span>${label}</span>`).join('')}
+        </div>
+        <div class="grid grid-cols-7 gap-y-0.5">${days}</div>`;
     }
- 
+
+    /** The date field: typed text plus a hidden YYYY-MM-DD value that is what actually gets saved. */
+    const renderDateField = (dateKey) => `
+      <div data-date-field class="relative">
+        <div class="flex items-center gap-3 rounded-xl border border-line bg-surface-sunken px-4 py-3 transition-colors focus-within:border-accent/70 has-[[aria-invalid=true]]:border-red-400/70">
+          <span class="shrink-0 text-ink-muted">${icon('calendarSmall', 'h-4 w-4')}</span>
+          <input name="dateText" type="text" autocomplete="off" spellcheck="false" maxlength="40"
+                 value="${esc(DateUtils.formatDateField(DateUtils.fromKey(dateKey)))}" placeholder="Weekday, Month Day" aria-label="Date"
+                 role="combobox" aria-haspopup="dialog" aria-expanded="false" aria-controls="date-panel"
+                 class="w-full min-w-0 bg-transparent text-sm outline-none placeholder:text-ink-faint" />
+          <input type="hidden" name="date" value="${esc(dateKey)}" />
+        </div>
+        <div id="date-panel" data-date-panel role="dialog" aria-label="Choose a date" hidden
+             class="absolute left-0 top-full z-20 mt-1.5 w-72 max-w-full rounded-xl border border-line bg-surface-raised p-3 shadow-2xl shadow-black/60"></div>
+      </div>`;
+
+    /** The purpose dropdown: a button that opens the same style of list as the time fields. */
+    const renderPurposeField = (options, active) => `
+      <div data-purpose-field class="relative">
+        <button type="button" data-purpose-button role="combobox" aria-haspopup="listbox" aria-expanded="false"
+                aria-controls="purpose-list" aria-label="Purpose"
+                class="flex w-full items-center gap-3 rounded-xl border border-line bg-surface-sunken px-4 py-3 text-left text-sm transition-colors focus-visible:outline-none focus-visible:border-accent/70">
+          <span data-purpose-dot class="h-3 w-3 shrink-0 rounded-[3px]" style="background:${esc(active?.color ?? '#888')}"></span>
+          <span data-purpose-label class="min-w-0 flex-1 truncate">${esc(active?.name ?? '')}</span>
+          <span data-purpose-chevron class="text-ink-muted transition-transform">${icon('chevronDown', 'h-4 w-4')}</span>
+        </button>
+        <input type="hidden" name="calendarId" value="${esc(active?.id ?? '')}" />
+        <div id="purpose-list" role="listbox" aria-label="Purpose options" hidden
+             class="absolute bottom-full left-0 z-20 mb-1.5 w-full overflow-y-auto rounded-xl border border-line bg-surface-raised py-1.5 shadow-2xl shadow-black/60">
+          ${options.map((cal) => `
+            <div role="option" id="purpose-opt-${esc(cal.id)}" data-purpose-option="${esc(cal.id)}" data-color="${esc(cal.color)}"
+                 aria-selected="${cal.id === active?.id}" ${cal.id === active?.id ? 'data-selected data-active' : ''}
+                 class="flex cursor-pointer items-center gap-3 px-4 py-2 text-sm text-ink data-[active]:bg-white/10 data-[selected]:font-medium data-[selected]:text-accent">
+              <span class="h-3 w-3 shrink-0 rounded-[3px]" style="background:${esc(cal.color)}"></span>
+              <span class="truncate">${esc(cal.name)}</span>
+            </div>`).join('')}
+        </div>
+      </div>`;
+
     /** Small reusable helper: every form row shares the same look. */
     const fieldRow = (iconName, inner, extraClasses = '') => `
       <div class="flex items-center gap-3 rounded-xl border border-line bg-surface-sunken px-4 py-3 ${extraClasses}">
         <span class="shrink-0 text-ink-muted">${icon(iconName, 'h-4 w-4')}</span>${inner}
       </div>`;
- 
+
+    const renderAttachmentChip = (a) => `
+      <span data-attachment data-file-id="${esc(a.fileId)}" data-file-url="${esc(a.fileUrl)}" data-title="${esc(a.title)}" data-mime="${esc(a.mimeType)}" data-icon="${esc(a.iconLink)}"
+            class="inline-flex max-w-[16rem] items-center gap-2 rounded-lg border border-line bg-surface py-1.5 pl-2.5 pr-1.5 text-xs">
+        ${a.iconLink
+          ? `<img src="${esc(a.iconLink)}" alt="" referrerpolicy="no-referrer" class="h-4 w-4 shrink-0" />`
+          : `<span class="shrink-0 text-ink-muted">${icon('file', 'h-4 w-4')}</span>`}
+        <a href="${esc(a.fileUrl)}" target="_blank" rel="noopener noreferrer" title="${esc(a.title)}" class="min-w-0 truncate hover:underline">${esc(a.title)}</a>
+        <button type="button" data-remove-attachment aria-label="Remove ${esc(a.title)}" class="shrink-0 rounded p-0.5 text-ink-muted hover:text-ink">${icon('close', 'h-3 w-3')}</button>
+      </span>`;
+
+    /** The description: a formatting toolbar, the editable text, and the attached Drive files. */
+    function renderDescriptionField(event) {
+      const html = descriptionToHtml(event.description);
+      const attachments = (event.attachments ?? []).map(normalizeAttachment).filter(Boolean);
+      const tool = (cmd, label, iconName, state) => `
+        <button type="button" data-rich-cmd="${cmd}" ${state ? `data-state-cmd="${state}" aria-pressed="false"` : ''} aria-label="${label}" title="${label}"
+                class="flex h-8 w-8 items-center justify-center rounded-lg text-ink-muted transition-colors hover:bg-white/5 hover:text-ink">${icon(iconName, 'h-4 w-4')}</button>`;
+      const divider = '<span class="mx-1.5 h-5 w-px bg-line" aria-hidden="true"></span>';
+
+      return `
+        <div class="rounded-xl border border-line bg-surface-sunken transition-colors focus-within:border-accent/70">
+          <div role="toolbar" aria-label="Description formatting" data-rich-toolbar class="flex flex-wrap items-center px-3 pt-2">
+            ${tool('drive', 'Attach from Google Drive', 'drive')}
+            ${divider}
+            ${tool('bold', 'Bold (Ctrl+B)', 'bold', 'bold')}
+            ${tool('italic', 'Italic (Ctrl+I)', 'italic', 'italic')}
+            ${tool('underline', 'Underline (Ctrl+U)', 'underline', 'underline')}
+            ${divider}
+            ${tool('ol', 'Numbered list', 'listOrdered', 'insertOrderedList')}
+            ${tool('ul', 'Bulleted list', 'listBullet', 'insertUnorderedList')}
+            ${divider}
+            ${tool('link', 'Insert link (Ctrl+K)', 'link')}
+            ${tool('clear', 'Clear formatting', 'removeFormat')}
+          </div>
+          <div data-rich-panel class="mx-3 mt-2 hidden flex-wrap items-center gap-2 rounded-lg border border-line bg-surface px-3 py-2"></div>
+          <div id="field-description" data-rich-editor contenteditable="true" role="textbox" aria-multiline="true" aria-label="Description"
+               data-placeholder="Add description" data-empty="${html ? 'false' : 'true'}"
+               class="max-h-56 min-h-24 overflow-y-auto px-4 pb-3 pt-2 text-sm leading-relaxed outline-none">${html}</div>
+          <div data-attachments class="flex flex-wrap gap-2 px-3 pb-3 empty:hidden">${attachments.map(renderAttachmentChip).join('')}</div>
+        </div>`;
+    }
+
     const ModalModule = {
       id: 'schedule-modal',
       slot: '#slot-modal',
@@ -1075,15 +2817,18 @@
         if (!state.modal) return '';
         const { mode, event } = state.modal;
         const calendars = Selectors.calendarMap(state);
-        const activeColor = calendars.get(event.calendarId)?.color ?? '#888';
-        const inputBase = 'w-full bg-transparent text-sm outline-none placeholder:text-ink-faint';
- 
-        const calendarOptions = state.accounts.map((account) => `
-          <optgroup label="${esc(account.email)}">
-            ${account.calendars.map((cal) => `
-              <option value="${esc(cal.id)}" data-color="${esc(cal.color)}" ${cal.id === event.calendarId ? 'selected' : ''}>${esc(cal.name)}</option>`).join('')}
-          </optgroup>`).join('');
- 
+                const inputBase = 'w-full bg-transparent text-sm outline-none placeholder:text-ink-faint';
+        // All-day events are stored as 00:00-24:00, so show a sensible range if the box is unticked.
+        const { start: startMinutes, end: endMinutes } = event.allDay ? closestHalfHourRange(state.now) : event;
+
+        // The purposes, plus the event's own calendar if it is something else, so editing never loses it.
+        const purposeOptions = PURPOSES.map((p) => calendars.get(p.id)).filter(Boolean);
+        if (!purposeOptions.length) purposeOptions.push(...Selectors.allCalendars(state));
+        if (calendars.has(event.calendarId) && !purposeOptions.some((c) => c.id === event.calendarId)) {
+          purposeOptions.push(calendars.get(event.calendarId));
+        }
+        const activePurpose = purposeOptions.find((c) => c.id === event.calendarId) ?? purposeOptions[0];
+
         return `
           <div data-modal-overlay class="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-black/60 p-4 backdrop-blur-sm">
             <form id="schedule-form" novalidate role="dialog" aria-modal="true" aria-labelledby="modal-heading"
@@ -1092,39 +2837,42 @@
                 <h2 id="modal-heading" class="text-base font-medium">${mode === 'edit' ? 'Edit schedule' : 'Add schedule'}</h2>
                 <button type="button" data-close-modal aria-label="Close" class="rounded-full p-1 text-ink-muted hover:text-ink">${icon('close')}</button>
               </div>
- 
+
               <label class="sr-only" for="field-title">Title</label>
               <input id="field-title" name="title" type="text" value="${esc(event.title)}" placeholder="Add a title" autocomplete="off"
                      class="mb-5 w-full bg-transparent text-3xl outline-none placeholder:text-ink-faint" />
- 
+
               <div class="flex flex-col gap-3">
-                ${fieldRow('calendarSmall', `<input name="date" type="date" required value="${esc(event.date)}" aria-label="Date" class="${inputBase}" />`)}
- 
-                <div class="grid grid-cols-[1fr_auto_1fr] items-center gap-2">
-                  ${fieldRow('clock', `<select name="start" aria-label="Start time" class="${inputBase} appearance-none">${renderTimeOptions(event.start, 0, 23 * 60 + 30)}</select>`)}
-                  <span class="text-ink-muted">${icon('arrowRight', 'h-4 w-4')}</span>
-                  <div class="rounded-xl border border-line bg-surface-sunken px-4 py-3">
-                    <select name="end" aria-label="End time" class="${inputBase} appearance-none">${renderTimeOptions(event.end, CONFIG.SNAP_MINUTES, 24 * 60)}</select>
+                ${renderDateField(event.date)}
+
+                <div>
+                  <div class="grid grid-cols-[1fr_auto_1fr] items-center gap-2">
+                    ${renderTimeField('start', 'Start time', startMinutes, true, event.allDay)}
+                    <span class="text-ink-muted">${icon('arrowRight', 'h-4 w-4')}</span>
+                    ${renderTimeField('end', 'End time', endMinutes, false, event.allDay)}
                   </div>
+                  <label class="mt-3 flex w-fit cursor-pointer select-none items-center gap-3 px-1 text-sm">
+                    <input type="checkbox" name="allDay" class="peer sr-only" ${event.allDay ? 'checked' : ''} />
+                    <span class="flex h-5 w-5 items-center justify-center rounded-md border border-line bg-surface-sunken text-black transition-colors peer-checked:border-accent peer-checked:bg-accent peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-accent [&>svg]:opacity-0 peer-checked:[&>svg]:opacity-100">${icon('check', 'h-3.5 w-3.5')}</span>
+                    All day
+                  </label>
                 </div>
- 
+
                 ${fieldRow('user', `
                   <div id="guest-field" class="flex flex-1 flex-wrap items-center gap-2">
                     ${event.guests.map(renderGuestChip).join('')}
                     <input id="guest-input" type="email" placeholder="Add guests" autocomplete="off" aria-label="Add guest email" class="min-w-[6rem] flex-1 ${inputBase}" />
                   </div>`)}
- 
+
                 ${fieldRow('link', `<input name="link" type="url" value="${esc(event.link)}" placeholder="Add a meeting link" aria-label="Meeting link" class="${inputBase}" />`)}
- 
-                <div class="flex items-center gap-3 rounded-xl border border-line bg-surface-sunken px-4 py-3">
-                  <span id="calendar-dot" class="h-3 w-3 shrink-0 rounded-[3px]" style="background:${esc(activeColor)}"></span>
-                  <select name="calendarId" aria-label="Calendar" class="${inputBase} appearance-none">${calendarOptions}</select>
-                  <span class="text-ink-muted">${icon('chevronDown', 'h-4 w-4')}</span>
-                </div>
+
+                ${renderDescriptionField(event)}
+
+                ${renderPurposeField(purposeOptions, activePurpose)}
               </div>
- 
+
               <p id="form-error" role="alert" class="mt-3 min-h-5 text-sm text-red-400"></p>
- 
+
               <div class="mt-2 flex items-center justify-between gap-2">
                 <div>${mode === 'edit' ? `<button type="button" data-delete-event class="flex items-center gap-2 rounded-xl px-3 py-2.5 text-sm text-red-400 hover:bg-red-400/10">${icon('trash', 'h-4 w-4')}Delete</button>` : ''}</div>
                 <div class="flex gap-2">
@@ -1135,17 +2883,44 @@
             </form>
           </div>`;
       },
- 
+
       afterRender(el) {
         el.querySelector('[name="title"]')?.focus();
       },
- 
+
       bind(el, { store, actions }) {
         const showError = (message) => {
           const target = el.querySelector('#form-error');
           if (target) target.textContent = message;
         };
- 
+
+        /** "Are you sure?" prompt on top of the schedule dialog. Added to the DOM directly so the form keeps its state. */
+        const openDeleteConfirm = () => {
+          if (el.querySelector('[data-confirm-overlay]')) return;
+          const { modal } = store.getState();
+          const title = String(modal?.event?.title ?? '').trim();
+          el.insertAdjacentHTML('beforeend', `
+            <div data-confirm-overlay class="fixed inset-0 z-[60] flex items-center justify-center overflow-y-auto bg-black/60 p-4 backdrop-blur-sm">
+              <div role="alertdialog" aria-modal="true" aria-labelledby="confirm-delete-heading" aria-describedby="confirm-delete-text"
+                   class="my-auto w-full max-w-sm rounded-3xl border border-line bg-surface p-6 shadow-2xl">
+                <h2 id="confirm-delete-heading" class="text-xl">Delete this schedule?</h2>
+                <p id="confirm-delete-text" class="mt-2 text-sm text-ink-muted">
+                  ${title ? `"${esc(title)}" will be permanently deleted.` : 'This schedule will be permanently deleted.'}
+                  This can't be undone.
+                </p>
+                <div class="mt-6 flex justify-end gap-2">
+                  <button type="button" data-cancel-delete class="rounded-xl border border-line px-5 py-2.5 text-sm hover:bg-white/5">Cancel</button>
+                  <button type="button" data-confirm-delete class="flex items-center gap-2 rounded-xl bg-red-500 px-5 py-2.5 text-sm font-medium text-white hover:bg-red-500/90">${icon('trash', 'h-4 w-4')}Delete</button>
+                </div>
+              </div>
+            </div>`);
+          el.querySelector('[data-cancel-delete]')?.focus();
+        };
+        const closeDeleteConfirm = () => {
+          el.querySelector('[data-confirm-overlay]')?.remove();
+          el.querySelector('[data-delete-event]')?.focus();
+        };
+
         /** Turn whatever is typed in the guest box into a chip. Returns false if invalid. */
         const commitGuestInput = () => {
           const input = el.querySelector('#guest-input');
@@ -1158,67 +2933,688 @@
           showError('');
           return true;
         };
- 
+
+        /* ---------- Time pickers ---------- */
+        const timeInput = (name) => el.querySelector(`input[name="${name}"]`);
+        const timeList = (name) => el.querySelector(`#time-list-${name}`);
+        const isListOpen = (name) => !timeList(name)?.hidden;
+        const readMinutes = (name) => parseTimeInput(timeInput(name)?.value, { allowEndOfDay: name === 'end' })?.minutes ?? null;
+
+        /** Mark the option matching `minutes` as active (hover/keyboard) and/or selected (current value). */
+        function markOptions(name, { active, selected, scroll = true }) {
+          const list = timeList(name);
+          if (!list) return;
+          const options = [...list.querySelectorAll('[data-time-option]')];
+          // An end of 24:00 is shown (and listed) as 12:00 AM, the first row.
+          selected = selected === 1440 ? 0 : selected;
+          active = active === 1440 ? 0 : active;
+          const nearest = (m) => m == null ? null : options.reduce((best, o) =>
+            Math.abs(Number(o.dataset.timeOption) - m) < Math.abs(Number(best.dataset.timeOption) - m) ? o : best);
+          const selectedEl = nearest(selected);
+          const exact = selected != null && selectedEl && Number(selectedEl.dataset.timeOption) === selected;
+          const activeEl = active === undefined ? null : nearest(active);
+          options.forEach((o) => {
+            o.toggleAttribute('data-selected', exact && o === selectedEl);
+            o.toggleAttribute('data-active', o === (activeEl ?? (exact ? selectedEl : null)));
+            o.setAttribute('aria-selected', String(exact && o === selectedEl));
+          });
+          const focusEl = activeEl ?? selectedEl;
+          timeInput(name).setAttribute('aria-activedescendant', focusEl ? focusEl.id : '');
+          if (scroll && focusEl) {
+            // Bring the option to the top third of the list, like Google Calendar.
+            list.scrollTop = Math.max(focusEl.offsetTop - list.clientHeight / 3, 0);
+          }
+        }
+
+        function openList(name) {
+          if (el.querySelector('input[name="allDay"]')?.checked) return;
+          closeDatePanel();
+          closePurpose();
+          ['start', 'end'].filter((n) => n !== name).forEach(closeList);
+          const list = timeList(name);
+          if (!list || !list.hidden) return;
+          list.hidden = false;
+          timeInput(name).setAttribute('aria-expanded', 'true');
+          markOptions(name, { selected: readMinutes(name) });
+        }
+        function closeList(name) {
+          const list = timeList(name);
+          if (!list || list.hidden) return;
+          list.hidden = true;
+          const input = timeInput(name);
+          input.setAttribute('aria-expanded', 'false');
+          input.removeAttribute('aria-activedescendant');
+        }
+
+        /** Tidy the typed text into hh:mm. Returns true when the value is valid. */
+        function commitTime(name, { fixEnd = true } = {}) {
+          const input = timeInput(name);
+          if (!input || input.disabled) return true;
+          const parsed = parseTimeInput(input.value, { allowEndOfDay: name === 'end' });
+          if (!parsed) {
+            input.setAttribute('aria-invalid', 'true');
+            showError(TIME_ERROR);
+            return false;
+          }
+          let { minutes } = parsed;
+          // "5" typed as an end time after 16:30 almost certainly means 17:00.
+          if (name === 'end' && fixEnd && !parsed.hadSuffix) {
+            const start = readMinutes('start');
+            if (start != null && minutes <= start && parsed.typedHours >= 1 && parsed.typedHours <= 11 && minutes + 720 <= 24 * 60) minutes += 720;
+          }
+          input.value = DateUtils.formatTimeField(minutes);
+          input.removeAttribute('aria-invalid');
+          const message = el.querySelector('#form-error');
+          if (message?.textContent === TIME_ERROR) showError('');
+          return true;
+        }
+
+        /** Choose a time from the list. Changing the start keeps the event's length. */
+        function chooseTime(name, minutes) {
+          if (name === 'start') {
+            const oldStart = readMinutes('start');
+            const oldEnd = readMinutes('end');
+            if (oldStart != null && oldEnd != null && oldEnd > oldStart) {
+              timeInput('end').value = DateUtils.formatTimeField(Math.min(minutes + (oldEnd - oldStart), 24 * 60));
+              timeInput('end').removeAttribute('aria-invalid');
+            }
+          }
+          const input = timeInput(name);
+          input.value = DateUtils.formatTimeField(minutes);
+          input.removeAttribute('aria-invalid');
+          closeList(name);
+          input.focus();
+          input.select();
+        }
+
+        function setAllDay(checked) {
+          ['start', 'end'].forEach((name) => {
+            const input = timeInput(name);
+            input.disabled = checked;
+            if (checked) { closeList(name); input.removeAttribute('aria-invalid'); }
+          });
+          if (checked) {
+            const message = el.querySelector('#form-error');
+            if (message?.textContent === TIME_ERROR) showError('');
+          }
+        }
+
+        /* ---------- Date picker ---------- */
+        const dateInput = () => el.querySelector('input[name="dateText"]');
+        const dateValue = () => el.querySelector('input[name="date"]');
+        const datePanel = () => el.querySelector('#date-panel');
+        const isDateOpen = () => !datePanel()?.hidden;
+        const committedDate = () => DateUtils.fromKey(dateValue().value);
+        const todayKey = () => DateUtils.toKey(store.getState().now);
+
+        function drawDatePanel(viewDate, selectedDate) {
+          const panel = datePanel();
+          const view = DateUtils.firstOfMonth(viewDate);
+          panel.dataset.view = DateUtils.toKey(view);
+          panel.innerHTML = renderDatePanel(view, selectedDate ? DateUtils.toKey(selectedDate) : '', todayKey());
+        }
+        function openDatePanel() {
+          ['start', 'end'].forEach(closeList);
+          closePurpose();
+          if (isDateOpen()) return;
+          drawDatePanel(committedDate(), committedDate());
+          datePanel().hidden = false;
+          dateInput().setAttribute('aria-expanded', 'true');
+        }
+        function closeDatePanel() {
+          const panel = datePanel();
+          if (!panel || panel.hidden) return;
+          panel.hidden = true;
+          dateInput().setAttribute('aria-expanded', 'false');
+        }
+        function setDate(date) {
+          dateValue().value = DateUtils.toKey(date);
+          dateInput().value = DateUtils.formatDateField(date);
+          dateInput().removeAttribute('aria-invalid');
+          const message = el.querySelector('#form-error');
+          if (message?.textContent === DATE_ERROR) showError('');
+          if (isDateOpen()) drawDatePanel(date, date);
+        }
+        /** Tidy the typed text into "Weekday, Month Day". Returns true when it is a valid date. */
+        function commitDate() {
+          const input = dateInput();
+          const parsed = parseDateInput(input.value, committedDate(), store.getState().now);
+          if (!parsed) {
+            input.setAttribute('aria-invalid', 'true');
+            showError(DATE_ERROR);
+            return false;
+          }
+          setDate(parsed);
+          return true;
+        }
+
+        /* ---------- Purpose dropdown ---------- */
+        const purposeButton = () => el.querySelector('[data-purpose-button]');
+        const purposeList = () => el.querySelector('#purpose-list');
+        const isPurposeOpen = () => !purposeList()?.hidden;
+        const purposeOptions = () => [...el.querySelectorAll('[data-purpose-option]')];
+
+        function markPurpose(activeId) {
+          purposeOptions().forEach((o) => o.toggleAttribute('data-active', o.dataset.purposeOption === activeId));
+          purposeButton().setAttribute('aria-activedescendant', activeId ? `purpose-opt-${activeId}` : '');
+        }
+        function openPurpose() {
+          if (!purposeList() || isPurposeOpen()) return;
+          closeDatePanel();
+          ['start', 'end'].forEach(closeList);
+          purposeList().hidden = false;
+          purposeButton().setAttribute('aria-expanded', 'true');
+          purposeButton().querySelector('[data-purpose-chevron]').classList.add('rotate-180');
+          markPurpose(el.querySelector('input[name="calendarId"]').value);
+        }
+        function closePurpose() {
+          if (!purposeList() || !isPurposeOpen()) return;
+          purposeList().hidden = true;
+          const button = purposeButton();
+          button.setAttribute('aria-expanded', 'false');
+          button.removeAttribute('aria-activedescendant');
+          button.querySelector('[data-purpose-chevron]').classList.remove('rotate-180');
+        }
+        function choosePurpose(id) {
+          const option = purposeOptions().find((o) => o.dataset.purposeOption === id);
+          if (!option) return;
+          el.querySelector('input[name="calendarId"]').value = id;
+          el.querySelector('[data-purpose-label]').textContent = option.textContent.trim();
+          el.querySelector('[data-purpose-dot]').style.background = option.dataset.color;
+          purposeOptions().forEach((o) => {
+            o.toggleAttribute('data-selected', o === option);
+            o.setAttribute('aria-selected', String(o === option));
+          });
+          closePurpose();
+          purposeButton().focus();
+        }
+
         el.addEventListener('click', (e) => {
-          if (e.target.closest('[data-close-modal]') || e.target.matches('[data-modal-overlay]')) return actions.closeModal();
- 
-          const removeGuest = e.target.closest('[data-remove-guest]');
-          if (removeGuest) return removeGuest.closest('[data-guest]').remove();
- 
-          if (e.target.closest('[data-delete-event]')) {
-            const { modal } = store.getState();
-            if (modal?.event.id) actions.deleteEvent(modal.event.id);
+          if (e.target.closest('[data-purpose-button]')) return isPurposeOpen() ? closePurpose() : openPurpose();
+          const option = e.target.closest('[data-purpose-option]');
+          if (option) return choosePurpose(option.dataset.purposeOption);
+          closePurpose(); // any other click closes it
+        });
+        el.addEventListener('mouseover', (e) => {
+          const option = e.target.closest('[data-purpose-option]');
+          if (option) markPurpose(option.dataset.purposeOption);
+        });
+        el.addEventListener('focusout', (e) => {
+          if (e.target.closest?.('[data-purpose-button]') && !e.relatedTarget?.closest?.('#purpose-list')) closePurpose();
+        });
+        el.addEventListener('keydown', (e) => {
+          if (!e.target.closest?.('[data-purpose-button]')) return;
+          const ids = purposeOptions().map((o) => o.dataset.purposeOption);
+          const activeId = () => el.querySelector('[data-purpose-option][data-active]')?.dataset.purposeOption
+            ?? el.querySelector('input[name="calendarId"]').value;
+
+          if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+            e.preventDefault();
+            if (!isPurposeOpen()) return openPurpose();
+            const i = ids.indexOf(activeId()) + (e.key === 'ArrowDown' ? 1 : -1);
+            markPurpose(ids[Math.min(Math.max(i, 0), ids.length - 1)]);
+          } else if (e.key === 'Enter' || e.key === ' ') {
+            if (!isPurposeOpen() && e.key === 'Enter') return; // Enter on a closed dropdown submits as usual
+            e.preventDefault();
+            if (isPurposeOpen()) choosePurpose(activeId()); else openPurpose();
+          } else if (e.key === 'Escape' && isPurposeOpen()) {
+            e.stopPropagation(); // close the list, not the whole dialog
+            closePurpose();
+          } else if (e.key === 'Tab') {
+            closePurpose();
           }
         });
- 
+
+        // Focus/click opens the list and selects the text so typing replaces it.
+        el.addEventListener('focusin', (e) => {
+          if (e.target.name === 'dateText') {
+            e.target.dataset.justFocused = 'true';
+            openDatePanel();
+            e.target.select();
+            return;
+          }
+          const name = e.target.closest?.('[data-time-field] input')?.name;
+          if (!name) return;
+          e.target.dataset.justFocused = 'true';
+          openList(name);
+          e.target.select();
+        });
+        el.addEventListener('mouseup', (e) => {
+          if (e.target.dataset?.justFocused) { e.preventDefault(); delete e.target.dataset.justFocused; }
+        });
+        el.addEventListener('click', (e) => {
+          if (e.target.name === 'dateText') return openDatePanel();
+          const name = e.target.closest?.('[data-time-field] input')?.name;
+          if (name) openList(name);
+        });
+        el.addEventListener('focusout', (e) => {
+          if (e.target.name === 'dateText') {
+            delete e.target.dataset.justFocused;
+            closeDatePanel();
+            if (e.target.value.trim()) commitDate();
+            return;
+          }
+          const name = e.target.closest?.('[data-time-field] input')?.name;
+          if (!name) return;
+          if (e.relatedTarget?.closest?.('[role="listbox"]')) return;
+          delete e.target.dataset.justFocused;
+          closeList(name);
+          if (e.target.value.trim()) commitTime(name);
+        });
+        el.addEventListener('input', (e) => {
+          if (e.target.matches?.('[data-rich-editor]')) return syncEditor();
+          if (e.target.name === 'dateText') {
+            e.target.removeAttribute('aria-invalid');
+            openDatePanel();
+            const parsed = parseDateInput(e.target.value, committedDate(), store.getState().now);
+            if (parsed) drawDatePanel(parsed, parsed); // jump the calendar to what is being typed
+            return;
+          }
+          const name = e.target.closest?.('[data-time-field] input')?.name;
+          if (!name) return;
+          e.target.removeAttribute('aria-invalid');
+          openList(name);
+          const parsed = parseTimeInput(e.target.value, { allowEndOfDay: name === 'end' });
+          markOptions(name, { selected: parsed?.minutes });
+        });
+        // Options: mousedown is cancelled so the input keeps focus (no blur flicker).
+        el.addEventListener('mousedown', (e) => {
+          // Keep focus in the input while using either dropdown (also covers dragging the scrollbar).
+          if (e.target.closest('[role="listbox"], [data-date-panel]')) e.preventDefault();
+        });
+        el.addEventListener('mouseover', (e) => {
+          const option = e.target.closest('[data-time-option]');
+          if (!option) return;
+          const name = option.closest('[data-time-field]').dataset.timeField;
+          markOptions(name, { active: Number(option.dataset.timeOption), selected: readMinutes(name), scroll: false });
+        });
+        el.addEventListener('click', (e) => {
+          const option = e.target.closest('[data-time-option]');
+          if (option) return chooseTime(option.closest('[data-time-field]').dataset.timeField, Number(option.dataset.timeOption));
+
+          const shift = e.target.closest('[data-cal-shift]');
+          if (shift) {
+            const view = DateUtils.fromKey(datePanel().dataset.view);
+            return drawDatePanel(DateUtils.addMonthsClamped(view, Number(shift.dataset.calShift)), parseDateInput(dateInput().value, committedDate(), store.getState().now));
+          }
+          const day = e.target.closest('[data-cal-day]');
+          if (day) {
+            setDate(DateUtils.fromKey(day.dataset.calDay));
+            closeDatePanel();
+            dateInput().focus();
+            return dateInput().select();
+          }
+          if (!e.target.closest('[data-time-field]')) ['start', 'end'].forEach(closeList);
+          if (!e.target.closest('[data-date-field]')) closeDatePanel();
+        });
+        el.addEventListener('keydown', (e) => {
+          if (e.target.name === 'dateText') {
+            const current = () => parseDateInput(e.target.value, committedDate(), store.getState().now) ?? committedDate();
+            const step = { ArrowUp: -7, ArrowDown: 7 }[e.key];
+            if (step) {           // up/down move by a week, like moving through the calendar grid
+              e.preventDefault();
+              if (!isDateOpen()) return openDatePanel();
+              const next = DateUtils.addDays(current(), step);
+              setDate(next); e.target.select();
+            } else if (e.key === 'PageUp' || e.key === 'PageDown') {
+              e.preventDefault();
+              if (!isDateOpen()) openDatePanel();
+              setDate(DateUtils.addMonthsClamped(current(), e.key === 'PageUp' ? -1 : 1)); e.target.select();
+            } else if (e.key === 'Enter' && isDateOpen()) {
+              e.preventDefault();
+              if (commitDate()) closeDatePanel();
+            } else if (e.key === 'Escape' && isDateOpen()) {
+              e.stopPropagation(); // close the calendar, not the whole dialog
+              closeDatePanel();
+            } else if (e.key === 'Tab') {
+              closeDatePanel();
+            }
+            return;
+          }
+          const name = e.target.closest?.('[data-time-field] input')?.name;
+          if (!name) return;
+          const list = timeList(name);
+          const current = () => Number(list.querySelector('[data-active]')?.dataset.timeOption ?? NaN);
+
+          if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+            e.preventDefault();
+            if (!isListOpen(name)) return openList(name);
+            const rawFrom = Number.isNaN(current()) ? readMinutes(name) : current();
+            const from = rawFrom === 1440 ? 0 : rawFrom;
+            const dir = e.key === 'ArrowDown' ? 1 : -1;
+            const base = from == null ? (dir > 0 ? -TIME_STEP : 24 * 60) : from;
+            const next = dir > 0 ? Math.floor(base / TIME_STEP) * TIME_STEP + TIME_STEP : Math.ceil(base / TIME_STEP) * TIME_STEP - TIME_STEP;
+            const clamped = Math.min(Math.max(next, 0), 24 * 60 - TIME_STEP);
+            markOptions(name, { active: clamped, selected: readMinutes(name) });
+            list.querySelector('[data-active]')?.scrollIntoView({ block: 'nearest' });
+          } else if (e.key === 'Enter') {
+            if (isListOpen(name) && !Number.isNaN(current())) {
+              e.preventDefault();
+              chooseTime(name, current());
+            } else if (isListOpen(name)) {
+              e.preventDefault();
+              if (commitTime(name)) closeList(name);
+            }
+            // With the list closed, Enter falls through and submits the form.
+          } else if (e.key === 'Escape' && isListOpen(name)) {
+            e.stopPropagation(); // close the list, not the whole dialog
+            closeList(name);
+          } else if (e.key === 'Tab') {
+            closeList(name);
+          }
+        });
+
+        /* ---- Description: rich-text editor + Google Drive attachments ---- */
+        const RICH_COMMANDS = { bold: 'bold', italic: 'italic', underline: 'underline', ol: 'insertOrderedList', ul: 'insertUnorderedList' };
+        const editorEl = () => el.querySelector('[data-rich-editor]');
+        const panelEl = () => el.querySelector('[data-rich-panel]');
+        let savedRange = null; // the text selection, remembered while a link box has the keyboard
+        let panelMode = null;  // null | 'link' | 'drive'
+
+        const insideEditor = (node) => Boolean(node && editorEl()?.contains(node));
+        const currentRange = () => (savedRange && insideEditor(savedRange.commonAncestorContainer) ? savedRange : null);
+        const linkAt = (node) => {
+          const link = (node?.nodeType === 1 ? node : node?.parentElement)?.closest?.('a');
+          return link && insideEditor(link) ? link : null;
+        };
+
+        const syncEditor = () => {
+          const editor = editorEl();
+          if (!editor) return;
+          const empty = editor.textContent.trim() === '' && !editor.querySelector('li, a');
+          if (empty && /^(<div>)?<br>(<\/div>)?$/i.test(editor.innerHTML)) editor.innerHTML = ''; // lets the placeholder show
+          editor.dataset.empty = String(empty);
+        };
+
+        const updateToolbar = () => {
+          const selection = getSelection();
+          const inside = Boolean(selection?.rangeCount) && insideEditor(selection.anchorNode);
+          el.querySelectorAll('[data-state-cmd]').forEach((button) => {
+            let on = false;
+            if (inside) { try { on = document.queryCommandState(button.dataset.stateCmd); } catch { on = false; } }
+            button.setAttribute('aria-pressed', String(on));
+          });
+        };
+
+        document.addEventListener('selectionchange', () => {
+          const selection = getSelection();
+          if (selection?.rangeCount && insideEditor(selection.anchorNode)) {
+            savedRange = selection.getRangeAt(0).cloneRange();
+            updateToolbar();
+          }
+        });
+
+        const restoreSelection = () => {
+          const editor = editorEl();
+          if (!editor) return;
+          editor.focus();
+          const range = currentRange();
+          if (range) { const selection = getSelection(); selection.removeAllRanges(); selection.addRange(range); }
+        };
+
+        const panelError = (message) => {
+          const target = panelEl()?.querySelector('[data-panel-error]');
+          if (target) target.textContent = message;
+        };
+
+        const closePanel = ({ restore = true } = {}) => {
+          const panel = panelEl();
+          if (!panel) return;
+          panel.classList.add('hidden');
+          panel.classList.remove('flex');
+          panel.innerHTML = '';
+          panelMode = null;
+          if (restore) restoreSelection();
+        };
+
+        const openPanel = (mode) => {
+          const panel = panelEl();
+          if (!panel) return;
+          showError('');
+          panelMode = mode;
+          const input = 'min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-ink-faint';
+          const apply = '<button type="button" data-panel-apply class="rounded-lg bg-white px-3 py-1.5 text-xs font-medium text-black hover:bg-white/90">';
+          const close = `<button type="button" data-panel-close aria-label="Close" class="rounded-full p-1 text-ink-muted hover:text-ink">${icon('close', 'h-3.5 w-3.5')}</button>`;
+          if (mode === 'link') {
+            const existing = linkAt(currentRange()?.commonAncestorContainer);
+            panel.innerHTML = `
+              <span class="shrink-0 text-ink-muted">${icon('link', 'h-4 w-4')}</span>
+              <input data-panel-input type="text" inputmode="url" autocomplete="off" spellcheck="false" aria-label="Link address"
+                     placeholder="Paste or type a link" value="${esc(existing?.getAttribute('href') ?? '')}" class="${input}" />
+              ${existing ? '<button type="button" data-panel-remove class="rounded-lg px-3 py-1.5 text-xs text-red-400 hover:bg-red-400/10">Remove</button>' : ''}
+              ${apply}Apply</button>${close}
+              <span data-panel-error role="alert" class="w-full text-xs text-red-400 empty:hidden"></span>`;
+          } else {
+            panel.innerHTML = `
+              <span class="shrink-0 text-ink-muted">${icon('drive', 'h-4 w-4')}</span>
+              <input data-panel-input type="text" inputmode="url" autocomplete="off" spellcheck="false" aria-label="Google Drive link"
+                     placeholder="Paste a Google Drive or Docs link" class="min-w-[10rem] ${input}" />
+              <input data-panel-name type="text" autocomplete="off" aria-label="File name (optional)" placeholder="Name (optional)"
+                     class="w-32 bg-transparent text-sm outline-none placeholder:text-ink-faint" />
+              ${apply}Attach</button>${close}
+              <span data-panel-error role="alert" class="w-full text-xs text-red-400 empty:hidden"></span>`;
+          }
+          panel.classList.remove('hidden');
+          panel.classList.add('flex');
+          panel.querySelector('[data-panel-input]')?.focus();
+        };
+
+        const addAttachments = (files) => {
+          const box = el.querySelector('[data-attachments]');
+          if (!box) return;
+          const keyOf = (file) => file.fileId || file.fileUrl;
+          const have = new Set([...box.querySelectorAll('[data-attachment]')].map((chip) => chip.dataset.fileId || chip.dataset.fileUrl));
+          files.map(normalizeAttachment).filter(Boolean).forEach((file) => {
+            if (have.has(keyOf(file))) return;
+            if (have.size >= MAX_ATTACHMENTS) return showError(`You can attach up to ${MAX_ATTACHMENTS} files.`);
+            box.insertAdjacentHTML('beforeend', renderAttachmentChip(file));
+            have.add(keyOf(file));
+          });
+        };
+
+        const attachFromDrive = async () => {
+          const user = googleUserOf(store.getState());
+          if (!DriveAttach.available(user)) return panelMode === 'drive' ? closePanel() : openPanel('drive');
+          showError('');
+          try {
+            const files = await DriveAttach.pick(user);
+            if (files.length) addAttachments(files);
+          } catch (error) {
+            if (!error.cancelled) showError(error.message);
+          }
+        };
+
+        const removeLink = () => {
+          const existing = linkAt(currentRange()?.commonAncestorContainer);
+          closePanel();
+          if (existing) {
+            const range = document.createRange();
+            range.selectNodeContents(existing);
+            const selection = getSelection();
+            selection.removeAllRanges();
+            selection.addRange(range);
+            document.execCommand('unlink');
+          }
+          syncEditor();
+        };
+
+        const applyPanel = () => {
+          const panel = panelEl();
+          const raw = panel?.querySelector('[data-panel-input]')?.value.trim() ?? '';
+
+          if (panelMode === 'drive') {
+            const parsed = parseDriveLink(raw);
+            if (!parsed) return panelError("That doesn't look like a Google Drive or Docs link.");
+            const name = panel.querySelector('[data-panel-name]')?.value.trim();
+            addAttachments([{ ...parsed, title: name || parsed.title }]);
+            return closePanel({ restore: false });
+          }
+
+          if (!raw) return linkAt(currentRange()?.commonAncestorContainer) ? removeLink() : closePanel();
+          let url = raw;
+          if (!/^[a-z][a-z0-9+.-]*:/i.test(url)) url = EMAIL_PATTERN.test(url) ? `mailto:${url}` : `https://${url}`;
+          if (!SAFE_URL.test(url)) return panelError('Links must start with http://, https:// or mailto:');
+          try { if (!/^mailto:/i.test(url)) new URL(url); } catch { return panelError('Enter a valid link.'); }
+
+          closePanel(); // gives the selection back to the editor
+          const selection = getSelection();
+          const existing = linkAt(selection.anchorNode);
+          if (existing && selection.isCollapsed) existing.setAttribute('href', url);
+          else if (selection.isCollapsed) document.execCommand('insertHTML', false, `<a href="${esc(url)}">${esc(url)}</a>&nbsp;`);
+          else document.execCommand('createLink', false, url);
+          syncEditor();
+        };
+
+        const runRichCommand = (cmd) => {
+          if (cmd === 'drive') return attachFromDrive();
+          if (cmd === 'link') return panelMode === 'link' ? closePanel() : openPanel('link');
+          if (panelMode) closePanel({ restore: false });
+          editorEl()?.focus();
+          if (RICH_COMMANDS[cmd]) document.execCommand(RICH_COMMANDS[cmd]);
+          else if (cmd === 'clear') { document.execCommand('removeFormat'); document.execCommand('unlink'); }
+          syncEditor();
+          updateToolbar();
+        };
+
+        // Toolbar buttons must not steal focus, or the text selection would be lost before the command runs.
+        el.addEventListener('mousedown', (e) => {
+          if (e.target.closest('[data-rich-toolbar] button')) e.preventDefault();
+        });
+
+        el.addEventListener('focusin', (e) => {
+          if (e.target.matches?.('[data-rich-editor]')) { try { document.execCommand('styleWithCSS', false, false); } catch { /* older browsers */ } }
+        });
+
+        el.addEventListener('click', (e) => {
+          const cmd = e.target.closest('[data-rich-cmd]')?.dataset.richCmd;
+          if (cmd) return runRichCommand(cmd);
+          if (e.target.closest('[data-panel-apply]')) return applyPanel();
+          if (e.target.closest('[data-panel-remove]')) return removeLink();
+          if (e.target.closest('[data-panel-close]')) return closePanel();
+          const removeAttachment = e.target.closest('[data-remove-attachment]');
+          if (removeAttachment) return removeAttachment.closest('[data-attachment]').remove();
+          const link = e.target.closest('[data-rich-editor] a');
+          if (link && (e.ctrlKey || e.metaKey)) window.open(link.href, '_blank', 'noopener,noreferrer');
+        });
+
+        el.addEventListener('keydown', (e) => {
+          if (e.target.closest('[data-rich-panel]')) {
+            if (e.key === 'Enter') { e.preventDefault(); applyPanel(); }      // Enter must not submit the whole form
+            else if (e.key === 'Escape') { e.stopPropagation(); closePanel(); } // close the box, not the whole dialog
+            return;
+          }
+          if (e.target.closest('[data-rich-editor]') && (e.ctrlKey || e.metaKey) && !e.altKey) {
+            const key = e.key.toLowerCase();
+            if (key === 'k') {
+              e.preventDefault();
+              openPanel('link');
+            } else if (key === 'b' || key === 'i' || key === 'u') {
+              // With nothing selected the browser fires no selection event, so refresh the highlight ourselves
+              // once the shortcut has taken effect.
+              setTimeout(updateToolbar, 0);
+            }
+          }
+        });
+
+        // Pasted content is rebuilt from the safe subset, so no stray fonts, colours or scripts come along.
+        el.addEventListener('paste', (e) => {
+          if (!e.target.closest?.('[data-rich-editor]')) return;
+          e.preventDefault();
+          const html = e.clipboardData.getData('text/html');
+          const text = e.clipboardData.getData('text/plain');
+          const clean = html ? sanitizeRichText(html) : sanitizeRichText(esc(text).replace(/\r?\n/g, '<br>'));
+          if (clean) document.execCommand('insertHTML', false, clean);
+          syncEditor();
+        });
+
+        el.addEventListener('change', (e) => {
+          if (e.target.name === 'allDay') setAllDay(e.target.checked);
+        });
+
+        el.addEventListener('click', (e) => {
+          if (e.target.closest('[data-close-modal]') || e.target.matches('[data-modal-overlay]')) return actions.closeModal();
+
+          const removeGuest = e.target.closest('[data-remove-guest]');
+          if (removeGuest) return removeGuest.closest('[data-guest]').remove();
+
+          // Delete asks for confirmation first; nothing is removed until "Delete" is pressed in the prompt.
+          if (e.target.closest('[data-delete-event]')) return openDeleteConfirm();
+
+          if (e.target.closest('[data-confirm-delete]')) {
+            const { modal } = store.getState();
+            if (modal?.event.id) actions.deleteEvent(modal.event.id);
+            return;
+          }
+          if (e.target.closest('[data-cancel-delete]') || e.target.matches('[data-confirm-overlay]')) closeDeleteConfirm();
+        });
+
+        el.addEventListener('keydown', (e) => {
+          if (!el.querySelector('[data-confirm-overlay]')) return;
+          if (e.key === 'Escape') {
+            e.stopPropagation(); // close the prompt, not the whole schedule dialog
+            closeDeleteConfirm();
+          } else if (e.key === 'Tab') {
+            // Keep focus inside the prompt while it is open.
+            const buttons = [...el.querySelectorAll('[data-confirm-overlay] button')];
+            const i = buttons.indexOf(document.activeElement);
+            e.preventDefault();
+            buttons[(i + (e.shiftKey ? -1 : 1) + buttons.length) % buttons.length].focus();
+          }
+        });
+
         el.addEventListener('keydown', (e) => {
           if (e.target.id === 'guest-input' && (e.key === 'Enter' || e.key === ',')) {
             e.preventDefault(); // Enter must not submit the whole form
             commitGuestInput();
           }
         });
- 
-        el.addEventListener('change', (e) => {
-          if (e.target.name === 'calendarId') {
-            const color = e.target.selectedOptions[0]?.dataset.color;
-            const dot = el.querySelector('#calendar-dot');
-            if (dot && color) dot.style.background = color;
-          }
-        });
- 
+
         el.addEventListener('submit', (e) => {
           e.preventDefault();
           if (!commitGuestInput()) return;
- 
+
           const form = e.target;
           const data = new FormData(form);
           const title = String(data.get('title') ?? '').trim();
-          const date = String(data.get('date') ?? '');
-          const start = Number(data.get('start'));
-          const end = Number(data.get('end'));
+          if (!dateInput().value.trim()) return showError('Choose a date.');
+          if (!commitDate()) return;
+          const date = dateValue().value;
+          const allDay = form.elements.allDay.checked;
           const link = String(data.get('link') ?? '').trim();
- 
+
           // Validate on the way in, and tell the user exactly what to fix.
           if (!title) return showError('Add a title before saving.');
           if (!date) return showError('Choose a date.');
-          if (end <= start) return showError('The end time must be after the start time.');
+          let start = 0;
+          let end = 24 * 60;
+          if (!allDay) {
+            if (!commitTime('start') || !commitTime('end')) return;
+            start = readMinutes('start');
+            end = readMinutes('end');
+            if (end <= start) return showError('The end time must be after the start time.');
+          }
           if (link && !/^https?:\/\//i.test(link)) return showError('The meeting link must start with http:// or https://.');
- 
+
           actions.saveEvent({
             id: store.getState().modal?.event.id ?? null,
-            title, date, start, end, link,
+            title, date, start, end, allDay, link,
+            description: sanitizeRichText(editorEl()?.innerHTML ?? ''),
+            attachments: [...form.querySelectorAll('[data-attachment]')].map((chip) => ({
+              fileId: chip.dataset.fileId, fileUrl: chip.dataset.fileUrl, title: chip.dataset.title,
+              mimeType: chip.dataset.mime, iconLink: chip.dataset.icon,
+            })),
             calendarId: String(data.get('calendarId')),
             guests: [...form.querySelectorAll('[data-guest]')].map((chip) => chip.dataset.guest),
           });
         });
- 
+
         // Escape closes the dialog from anywhere.
         document.addEventListener('keydown', (e) => {
           if (e.key === 'Escape' && store.getState().modal) actions.closeModal();
         });
       },
     };
- 
+
     /* ---------- 7.8 Toast ---------- */
     const ToastModule = {
       id: 'toast',
@@ -1228,12 +3624,12 @@
         ? `<div class="rounded-xl bg-white px-4 py-3 text-sm font-medium text-black shadow-lg">${esc(state.toast.message)}</div>`
         : '',
     };
- 
+
     /* ---------- 7.9 Pages ---------- */
- 
+
     /** The calendar page is static HTML; this module only toggles its visibility by route. */
     const CalendarPageModule = { id: 'page-calendar', slot: '#page-calendar', route: 'calendar' };
- 
+
     /** Home: a real page module that reuses selectors. Shows today's agenda. */
     const HomePageModule = {
       id: 'page-home',
@@ -1245,7 +3641,7 @@
       render(state) {
         const calendars = Selectors.calendarMap(state);
         const todayEvents = Selectors.eventsByDate(state).get(DateUtils.toKey(state.now)) ?? [];
- 
+
         const agenda = todayEvents.length
           ? `<ul class="mt-6 flex max-w-xl flex-col gap-2">
               ${todayEvents.map((event) => `
@@ -1253,7 +3649,7 @@
                   <span class="h-8 w-1.5 shrink-0 rounded-full" style="background:${esc(calendars.get(event.calendarId)?.color ?? '#888')}"></span>
                   <span class="min-w-0 flex-1">
                     <span class="block truncate text-sm font-medium">${esc(event.title)}</span>
-                    <span class="block text-xs text-ink-muted">${DateUtils.formatTime(event.start)} - ${DateUtils.formatTime(event.end)}</span>
+                    <span class="block text-xs text-ink-muted">${DateUtils.formatRange(event)}</span>
                   </span>
                 </li>`).join('')}
             </ul>`
@@ -1261,7 +3657,7 @@
               Nothing is scheduled today.
               <button type="button" data-action="new" class="ml-1 text-accent underline underline-offset-4">Add a schedule</button>
             </div>`;
- 
+
         return `
           <h1 class="text-2xl">Today</h1>
           <p class="text-sm text-ink-muted">${DateUtils.formatAgendaDate(state.now)}</p>
@@ -1273,7 +3669,7 @@
         });
       },
     };
- 
+
     /**
      * Factory function: one function that makes many similar modules.
      * Use this pattern whenever you'd otherwise copy-paste a module.
@@ -1291,7 +3687,7 @@
           <p class="max-w-sm text-sm text-ink-muted">${esc(description)}</p>`,
       };
     }
- 
+
     /* ================================================================
        8. BOOTSTRAP: wire everything together
        ================================================================ */
@@ -1299,13 +3695,14 @@
       const store = createStore(createInitialState());
       const actions = createActions(store);
       const ctx = { store, actions }; // handed to every module
- 
+
       // >>> ADD NEW MODULES TO THIS LIST <<<
       ModuleRegistry.register(
         RailModule,
         WorkspaceModule,
         MiniCalendarModule,
         AccountsModule,
+        GoogleSyncModule,
         CalendarPageModule,
         CalendarHeaderModule,
         CalendarBodyModule,
@@ -1313,26 +3710,46 @@
         createPlaceholderPage({ route: 'tasks',    title: 'Tasks',    description: 'Your task list will live here. Register a new module to build it.' }),
         createPlaceholderPage({ route: 'timer',    title: 'Timer',    description: 'A focus timer can live here. Register a new module to build it.' }),
         createPlaceholderPage({ route: 'settings', title: 'Settings', description: 'Preferences will live here. Register a new module to build it.' }),
+        AccountMenuModule,
+        AuthModalModule,
         ModalModule,
         ToastModule,
       );
- 
+
       // Save only when the data we care about actually changed.
-      let lastSaved = { events: store.getState().events, accounts: store.getState().accounts };
+      const trackedRefs = (s) => [s.events, s.accounts, s.users, s.activeUserId];
+      const buildSnapshot = (s) => ({
+        auth: { users: s.users, activeUserId: s.activeUserId },
+        workspaces: stashWorkspace(s),
+      });
+      let lastRefs = trackedRefs(store.getState());
       store.subscribe((state) => {
-        if (state.events !== lastSaved.events || state.accounts !== lastSaved.accounts) {
-          lastSaved = { events: state.events, accounts: state.accounts };
-          Persistence.save(lastSaved);
+        const refs = trackedRefs(state);
+        if (refs.some((ref, i) => ref !== lastRefs[i])) {
+          lastRefs = refs;
+          Persistence.save(buildSnapshot(state));
         }
       });
- 
+
+      // Global listeners for the auth popups (Escape to close, close menu on resize).
+      document.addEventListener('keydown', (e) => {
+        if (e.key !== 'Escape') return;
+        const { loginModal, accountMenu } = store.getState();
+        if (loginModal) actions.closeLogin();
+        else if (accountMenu) actions.closeAccountMenu();
+      });
+      window.addEventListener('resize', () => {
+        if (store.getState().accountMenu) actions.closeAccountMenu();
+      });
+
       ModuleRegistry.mountAll(ctx);
+      actions.startGoogleSync(); // background sync: poll, refocus, month navigation
+      if (CONFIG.OPEN_LOGIN_ON_LAUNCH && !store.getState().users.length) actions.openLogin('signin');
       setInterval(actions.tick, CONFIG.TICK_INTERVAL_MS); // move the "now" line
     }
- 
+
     bootstrap();
   })();
   </script>
 </body>
 </html>
- 
