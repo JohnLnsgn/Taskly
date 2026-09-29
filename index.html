@@ -1,0 +1,1338 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Taskly</title>
+ 
+  <!--
+    ============================================================
+    FONT: Google Sans
+    ============================================================
+    - `preconnect` opens the network connection early, so the font
+      file starts downloading sooner (a small but real speed win).
+    - `display=swap` shows fallback text immediately, then swaps in
+      Google Sans when it arrives (prevents invisible text).
+    - Only the weights we actually use (400/500/700) are requested.
+      Every extra weight is extra bytes for the visitor.
+  -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&display=swap" rel="stylesheet" />
+ 
+  <!--
+    ============================================================
+    STYLING: Tailwind CSS (Play CDN)
+    ============================================================
+    Tailwind is "utility-first": instead of writing custom CSS, you
+    compose small single-purpose classes right in the markup
+    (e.g. `rounded-2xl bg-surface p-4`).
+ 
+    NOTE: The Play CDN is perfect for prototypes and learning. For a
+    production site, install Tailwind via its CLI/build step so the
+    CSS is pre-compiled, smaller, and cached.
+  -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    /*
+      Design tokens live in ONE place: the Tailwind config.
+      Need to re-theme the app? Change a value here, not in 200 places.
+      Use semantic names ("surface", "ink") rather than literal ones
+      ("dark-gray") so the meaning survives a redesign.
+    */
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            // Fallback stack: if Google Sans fails to load, the browser
+            // walks down this list until it finds a font that exists.
+            sans: ['"Google Sans"', 'ui-sans-serif', 'system-ui', '-apple-system', 'Segoe UI', 'Roboto', 'sans-serif'],
+          },
+          colors: {
+            canvas: '#09090a',                       // page background
+            surface: {
+              DEFAULT: '#161617',                    // panels
+              raised: '#1e1e20',                     // buttons, headers inside panels
+              sunken: '#101011',                     // inputs, segmented controls
+            },
+            line: '#2a2a2e',                         // borders and dividers
+            ink: {
+              DEFAULT: '#f4f4f5',                    // primary text
+              muted: '#a1a1a6',                      // secondary text
+              faint: '#6b6b70',                      // disabled / out-of-range text
+            },
+            accent: '#d6ff3d',                       // brand highlight
+          },
+        },
+      },
+    };
+  </script>
+ 
+  <!--
+    A tiny base stylesheet. Tailwind handles component styling; this
+    block only covers global concerns that utilities can't express well:
+    keyboard focus rings, scrollbars, and reduced-motion preferences.
+  -->
+  <style>
+    :root { color-scheme: dark; --grid-line: #2a2a2e; }
+ 
+    /* Visible keyboard focus is an accessibility requirement, not decoration. */
+    :focus-visible { outline: 2px solid #d6ff3d; outline-offset: 2px; }
+ 
+    * { scrollbar-width: thin; scrollbar-color: #3a3a3f transparent; }
+ 
+    /* Respect users who ask their OS to minimise animation. */
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
+    }
+  </style>
+</head>
+ 
+<body class="h-full bg-canvas font-sans text-ink antialiased">
+ 
+  <!--
+    ============================================================
+    APP SHELL
+    ============================================================
+    The HTML is only a skeleton of named "slots" (elements whose id
+    starts with `slot-`). Each slot is owned by exactly one JavaScript
+    module (see the MODULES section below), which fills it with markup.
+ 
+    Layout is mobile-first: a column on small screens, a row from the
+    `md:` breakpoint up. The `lg:` breakpoint reveals the sidebar.
+  -->
+  <div id="app" class="flex h-full flex-col gap-3 p-3 md:flex-row">
+ 
+    <!-- Slot: primary navigation rail -->
+    <nav id="slot-rail" aria-label="Primary"
+         class="flex shrink-0 flex-row items-center gap-2 rounded-2xl bg-surface p-2 md:w-[4.5rem] md:flex-col md:py-4"></nav>
+ 
+    <!-- Sidebar: hidden on small screens, visible on large ones -->
+    <aside class="hidden w-72 shrink-0 flex-col gap-3 overflow-y-auto lg:flex" aria-label="Calendar tools">
+      <div id="slot-workspace"></div>
+      <div id="slot-mini-calendar"></div>
+      <div id="slot-accounts" class="flex flex-col gap-3"></div>
+    </aside>
+ 
+    <!-- Main area: every "page" module mounts inside #slot-pages -->
+    <main id="slot-pages" class="min-h-0 min-w-0 flex-1">
+ 
+      <!-- The calendar page has a static shell so its scroll position
+           survives re-renders (only the inner slots get re-rendered). -->
+      <section id="page-calendar" class="flex h-full flex-col overflow-hidden rounded-2xl bg-surface">
+        <header id="slot-calendar-header" class="shrink-0"></header>
+        <div id="slot-calendar-body" class="min-h-0 flex-1 overflow-auto border-t border-line"></div>
+      </section>
+ 
+    </main>
+  </div>
+ 
+  <!-- Overlays live outside #app so they can cover the whole viewport -->
+  <div id="slot-modal"></div>
+  <div id="slot-toast" aria-live="polite"
+       class="pointer-events-none fixed inset-x-0 bottom-6 z-[60] flex justify-center px-4"></div>
+ 
+ 
+  <script>
+  /* ==================================================================
+     CRONIX CALENDAR: ARCHITECTURE OVERVIEW
+     ==================================================================
+     This file is organised into numbered sections. Each has ONE job
+     ("separation of concerns"), which is what makes a codebase easy to
+     grow:
+ 
+       1. CONFIG      Constants. No magic numbers scattered around.
+       2. UTILITIES   Pure helper functions (dates, escaping, icons).
+       3. STORE       The single source of truth for app state.
+       4. SELECTORS   Read-only functions that derive data from state.
+       5. ACTIONS     The ONLY functions that change state.
+       6. REGISTRY    Mounts modules and keeps them in sync with state.
+       7. MODULES     Self-contained UI pieces (rail, calendar, modal...).
+       8. BOOTSTRAP   Wires everything together and starts the app.
+ 
+     DATA FLOW (one direction, easy to debug):
+ 
+       user clicks  ->  Action  ->  Store updates  ->  Modules re-render
+ 
+     ------------------------------------------------------------------
+     HOW TO ADD A NEW MODULE (3 steps)
+     ------------------------------------------------------------------
+       1. Write a module object:
+ 
+            const MyModule = {
+              id:   'my-module',          // unique, kebab-case
+              slot: '#slot-my-module',    // where it mounts
+              deps: (state) => [state.events],       // re-render only when these change
+              render: (state, ctx) => `<p>Hello</p>`, // returns an HTML string
+              bind: (el, ctx) => { ... },            // optional: attach event listeners ONCE
+            };
+ 
+       2. Add it to the list in the BOOTSTRAP section.
+       3. (Optional) Need a whole new page? Add `route`, `createIn` and
+          `slotClass` (see createPlaceholderPage) and no HTML edits are needed.
+ 
+     NAMING CONVENTIONS USED HERE
+       - UPPER_SNAKE_CASE  constants           (CONFIG, ICON_PATHS)
+       - PascalCase        module objects      (MiniCalendarModule)
+       - camelCase         functions/variables (renderTimeGrid)
+       - kebab-case        HTML ids            (slot-mini-calendar)
+       - data-* attributes are the "hooks" JavaScript uses to find
+         elements, so styling classes can change without breaking logic.
+     ================================================================== */
+ 
+  (() => {
+    'use strict'; // Opt in to stricter, safer JavaScript rules.
+ 
+    /* ================================================================
+       1. CONFIG
+       ================================================================ */
+    const CONFIG = Object.freeze({
+      LOCALE: 'en-US',
+      HOUR_HEIGHT: 56,            // px height of one hour in the time grid
+      GUTTER_WIDTH: '4.5rem',     // width of the hour-label column
+      SNAP_MINUTES: 30,           // clicking the grid snaps to this interval
+      DEFAULT_SCROLL_HOUR: 7,     // where the grid scrolls to on load
+      TOAST_DURATION_MS: 3200,
+      TICK_INTERVAL_MS: 60_000,   // how often the "now" line moves
+      STORAGE_KEY: 'cronix-calendar.v1',
+      EVENT_TEXT_COLOR: '#141414',
+    });
+ 
+    /* ================================================================
+       2. UTILITIES (pure functions: same input -> same output)
+       ================================================================ */
+ 
+    /**
+     * Escape text before putting it into an HTML string.
+     * ALWAYS do this for anything a user can type. Skipping it allows
+     * XSS (cross-site scripting) attacks.
+     */
+    const esc = (value) =>
+      String(value ?? '').replace(/[&<>"']/g, (ch) => (
+        { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]
+      ));
+ 
+    const pad2 = (n) => String(n).padStart(2, '0');
+ 
+    const DateUtils = {
+      startOfDay(date) {
+        const d = new Date(date);
+        d.setHours(0, 0, 0, 0);
+        return d;
+      },
+      addDays(date, n) {
+        const d = new Date(date);
+        d.setDate(d.getDate() + n);
+        return d;
+      },
+      firstOfMonth(date) {
+        return new Date(date.getFullYear(), date.getMonth(), 1);
+      },
+      /** Move by whole months, clamping the day (Jan 31 + 1 month = Feb 28). */
+      addMonthsClamped(date, n) {
+        const target = new Date(date.getFullYear(), date.getMonth() + n, 1);
+        const lastDay = new Date(target.getFullYear(), target.getMonth() + 1, 0).getDate();
+        target.setDate(Math.min(date.getDate(), lastDay));
+        return target;
+      },
+      /** Weeks start on Monday, matching the design. */
+      startOfWeek(date) {
+        const d = DateUtils.startOfDay(date);
+        return DateUtils.addDays(d, -((d.getDay() + 6) % 7));
+      },
+      /** "2026-09-29": a stable string key that is safe to store and compare. */
+      toKey(date) {
+        return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
+      },
+      fromKey(key) {
+        const [y, m, d] = key.split('-').map(Number);
+        return new Date(y, m - 1, d);
+      },
+      /** 750 -> "12:30 PM", 720 -> "12 PM" */
+      formatTime(totalMinutes) {
+        const hours24 = Math.floor(totalMinutes / 60) % 24;
+        const minutes = totalMinutes % 60;
+        const suffix = hours24 >= 12 ? 'PM' : 'AM';
+        const hours12 = hours24 % 12 === 0 ? 12 : hours24 % 12;
+        return minutes ? `${hours12}:${pad2(minutes)} ${suffix}` : `${hours12} ${suffix}`;
+      },
+      formatMonthYear: (d) => d.toLocaleDateString(CONFIG.LOCALE, { month: 'long', year: 'numeric' }),
+      formatWeekdayShort: (d) => d.toLocaleDateString(CONFIG.LOCALE, { weekday: 'short' }),
+      formatLong: (d) => d.toLocaleDateString(CONFIG.LOCALE, { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' }),
+      formatAgendaDate: (d) => d.toLocaleDateString(CONFIG.LOCALE, { weekday: 'long', month: 'long', day: 'numeric' }),
+      minutesSinceMidnight: (d) => d.getHours() * 60 + d.getMinutes(),
+      /** "GMT+8" (or "GMT+5:30") from the visitor's own timezone. */
+      gmtLabel() {
+        const offset = -new Date().getTimezoneOffset();
+        const abs = Math.abs(offset);
+        const minutes = abs % 60;
+        return `GMT${offset >= 0 ? '+' : '-'}${Math.floor(abs / 60)}${minutes ? ':' + pad2(minutes) : ''}`;
+      },
+    };
+ 
+    /** Unique id generator with a fallback for older browsers. */
+    const createId = () =>
+      (window.crypto && crypto.randomUUID)
+        ? crypto.randomUUID()
+        : `id-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+ 
+    /**
+     * Inline SVG icons. Keeping them in one dictionary means every icon
+     * is defined once and reused everywhere via icon('name').
+     * `currentColor` lets Tailwind's text-* classes colour the icon.
+     */
+    const ICON_PATHS = {
+      home: '<path d="M3 10.5 12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/>',
+      calendar: '<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/>',
+      tasks: '<path d="m9 11 3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>',
+      timer: '<circle cx="12" cy="13" r="8"/><path d="M12 9v4l2 2M9 2h6"/>',
+      settings: '<path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/>',
+      help: '<circle cx="12" cy="12" r="10"/><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3M12 17h.01"/>',
+      logout: '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/>',
+      chevronLeft: '<path d="m15 18-6-6 6-6"/>',
+      chevronRight: '<path d="m9 18 6-6-6-6"/>',
+      chevronDown: '<path d="m6 9 6 6 6-6"/>',
+      chevronUp: '<path d="m18 15-6-6-6 6"/>',
+      chevronsUpDown: '<path d="m7 15 5 5 5-5M7 9l5-5 5 5"/>',
+      plus: '<path d="M12 5v14M5 12h14"/>',
+      close: '<path d="M18 6 6 18M6 6l12 12"/>',
+      clock: '<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
+      user: '<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
+      link: '<path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/>',
+      arrowRight: '<path d="M5 12h14m-7-7 7 7-7 7"/>',
+      trash: '<path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/>',
+      calendarSmall: '<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/>',
+    };
+ 
+    const icon = (name, classes = 'h-5 w-5') =>
+      `<svg class="${classes}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICON_PATHS[name]}</svg>`;
+ 
+    /** Persist only what matters (events + accounts) to localStorage. */
+    const Persistence = {
+      load() {
+        try {
+          const raw = localStorage.getItem(CONFIG.STORAGE_KEY);
+          return raw ? JSON.parse(raw) : null;
+        } catch { return null; } // Storage can be blocked; never crash because of it.
+      },
+      save(data) {
+        try { localStorage.setItem(CONFIG.STORAGE_KEY, JSON.stringify(data)); } catch { /* ignore */ }
+      },
+    };
+ 
+    /* ================================================================
+       3. STORE: a tiny "publish/subscribe" state container
+       ================================================================
+       Rules that keep this predictable:
+         - State is NEVER mutated. We always create new objects/arrays
+           (`{...state}`, `[...list, item]`).
+         - Because of that, modules can cheaply detect change by checking
+           whether a reference is different (Object.is).
+    */
+    function createStore(initialState) {
+      let state = initialState;
+      const listeners = new Set();
+ 
+      return {
+        getState: () => state,
+        /** Accepts an object patch OR a function (state) => patch. */
+        setState(patch) {
+          const next = typeof patch === 'function' ? patch(state) : patch;
+          state = { ...state, ...next };
+          listeners.forEach((listener) => listener(state));
+        },
+        subscribe(listener) {
+          listeners.add(listener);
+          return () => listeners.delete(listener); // call to unsubscribe
+        },
+      };
+    }
+ 
+    /* ---------- Seed data (used on first visit only) ---------- */
+    function createSeedAccounts() {
+      return [
+        {
+          id: 'account-primary', email: 'you@gmail.com', expanded: true,
+          calendars: [
+            { id: 'project',   name: 'Project time',        color: '#ff6b6b', visible: true },
+            { id: 'personal',  name: 'Me time',             color: '#6f9bff', visible: true },
+            { id: 'freelance', name: 'Freelance work time', color: '#d6ff3d', visible: true },
+          ],
+        },
+        {
+          id: 'account-work', email: 'work@gmail.com', expanded: false,
+          calendars: [{ id: 'team', name: 'Team calendar', color: '#b794ff', visible: true }],
+        },
+      ];
+    }
+ 
+    /** dayOffset: 0 = Monday of the current week. Times are minutes since midnight. */
+    function createSeedEvents(weekStart) {
+      const at = (dayOffset) => DateUtils.toKey(DateUtils.addDays(weekStart, dayOffset));
+      const h = (hours, minutes = 0) => hours * 60 + minutes;
+      const make = (dayOffset, title, start, end, calendarId) =>
+        ({ id: createId(), title, date: at(dayOffset), start, end, calendarId, guests: [], link: '' });
+ 
+      return [
+        make(0, 'Project preparation',       h(8, 30), h(12, 30), 'project'),
+        make(0, 'Ideation in the café',      h(14),    h(16),     'project'),
+        make(1, 'Travel to Berlin',          h(9, 30), h(14),     'personal'),
+        make(2, 'Work from café',            h(8, 30), h(10, 45), 'freelance'),
+        make(2, 'Lunch in Berlin',           h(11),    h(12),     'personal'),
+        make(2, '2025 portfolio planning',   h(13),    h(16),     'freelance'),
+        make(3, 'Work from café',            h(8, 30), h(10, 30), 'personal'),
+        make(3, 'Sketching & wireframing',   h(11),    h(15),     'project'),
+        make(4, 'Weekly design exploration', h(9, 30), h(14),     'freelance'),
+        make(5, 'High-fidelity designing',   h(8, 30), h(12),     'project'),
+        make(5, 'Explore Schwarzwald',       h(13),    h(16),     'personal'),
+        make(6, 'Work from café',            h(8, 30), h(11),     'freelance'),
+        make(6, 'Lunch at the Barn Café',    h(11),    h(12, 30), 'personal'),
+        make(6, 'Feedback and prototyping',  h(12, 30), h(16),    'project'),
+      ];
+    }
+ 
+    function createInitialState() {
+      const today = DateUtils.startOfDay(new Date());
+      const saved = Persistence.load();
+      return {
+        activeRoute: 'calendar',   // which page is visible
+        view: 'week',              // 'day' | 'week' | 'month'
+        currentDate: today,        // the date the calendar is focused on
+        miniMonth: DateUtils.firstOfMonth(today), // month shown in the mini calendar
+        now: new Date(),           // updated every minute for the "now" line
+        accounts: saved?.accounts ?? createSeedAccounts(),
+        events: saved?.events ?? createSeedEvents(DateUtils.startOfWeek(today)),
+        modal: null,               // null | { mode: 'create' | 'edit', event }
+        toast: null,               // null | { id, message }
+      };
+    }
+ 
+    /* ================================================================
+       4. SELECTORS: derive data from state without changing it
+       ================================================================ */
+    const Selectors = {
+      allCalendars: (state) => state.accounts.flatMap((account) => account.calendars),
+      calendarMap: (state) => new Map(Selectors.allCalendars(state).map((cal) => [cal.id, cal])),
+      /** Only events whose calendar is switched on. */
+      visibleEvents(state) {
+        const calendars = Selectors.calendarMap(state);
+        return state.events.filter((event) => calendars.get(event.calendarId)?.visible);
+      },
+      /** Map of 'YYYY-MM-DD' -> events sorted by start time. */
+      eventsByDate(state) {
+        const map = new Map();
+        Selectors.visibleEvents(state).forEach((event) => {
+          if (!map.has(event.date)) map.set(event.date, []);
+          map.get(event.date).push(event);
+        });
+        map.forEach((list) => list.sort((a, b) => a.start - b.start || a.end - b.end));
+        return map;
+      },
+    };
+ 
+    /**
+     * Side-by-side layout for overlapping events ("lanes").
+     * Returns [{ event, lane, lanes }] so the UI can compute left/width.
+     */
+    function layoutOverlaps(events) {
+      const sorted = [...events].sort((a, b) => a.start - b.start || b.end - a.end);
+      const result = [];
+      let cluster = [];
+      let clusterEnd = -1;
+ 
+      const flushCluster = () => {
+        const laneEnds = [];
+        const placed = cluster.map((event) => {
+          let lane = laneEnds.findIndex((end) => end <= event.start);
+          if (lane === -1) { lane = laneEnds.length; laneEnds.push(event.end); }
+          else { laneEnds[lane] = event.end; }
+          return { event, lane };
+        });
+        placed.forEach((item) => result.push({ ...item, lanes: laneEnds.length }));
+        cluster = [];
+      };
+ 
+      sorted.forEach((event) => {
+        if (cluster.length && event.start >= clusterEnd) flushCluster();
+        cluster.push(event);
+        clusterEnd = cluster.length === 1 ? event.end : Math.max(clusterEnd, event.end);
+      });
+      flushCluster();
+      return result;
+    }
+ 
+    /* ================================================================
+       CALENDAR VIEW REGISTRY
+       ================================================================
+       Views (Day / Week / Month) are plugins too. Register a new one and
+       the header's view switcher picks it up automatically. Each view
+       provides a label, a render(state) function, and how to step
+       forward/back in time.
+    */
+    const CalendarViews = {};
+    const registerCalendarView = (id, definition) => { CalendarViews[id] = definition; };
+    const getWeekDays = (date) => {
+      const start = DateUtils.startOfWeek(date);
+      return Array.from({ length: 7 }, (_, i) => DateUtils.addDays(start, i));
+    };
+ 
+    /* ================================================================
+       5. ACTIONS: the only code allowed to change state
+       ================================================================ */
+    function createActions(store) {
+      const { getState, setState } = store;
+      let toastCounter = 0;
+      let toastTimer = null;
+ 
+      const actions = {
+        /* Navigation */
+        navigate: (route) => setState({ activeRoute: route }),
+        setView: (view) => setState({ view }),
+        selectDate: (date) => setState({
+          currentDate: DateUtils.startOfDay(date),
+          miniMonth: DateUtils.firstOfMonth(date),
+        }),
+        showDay(date) {
+          setState({
+            view: 'day',
+            currentDate: DateUtils.startOfDay(date),
+            miniMonth: DateUtils.firstOfMonth(date),
+          });
+        },
+        goToToday: () => actions.selectDate(new Date()),
+        shift(direction) {
+          const { view, currentDate } = getState();
+          actions.selectDate(CalendarViews[view].shift(currentDate, direction));
+        },
+        shiftMiniMonth: (direction) =>
+          setState((s) => ({ miniMonth: DateUtils.addMonthsClamped(s.miniMonth, direction) })),
+ 
+        /* Sidebar */
+        toggleAccount: (accountId) => setState((s) => ({
+          accounts: s.accounts.map((a) => a.id === accountId ? { ...a, expanded: !a.expanded } : a),
+        })),
+        toggleCalendar: (accountId, calendarId) => setState((s) => ({
+          accounts: s.accounts.map((a) => a.id !== accountId ? a : {
+            ...a,
+            calendars: a.calendars.map((c) => c.id === calendarId ? { ...c, visible: !c.visible } : c),
+          }),
+        })),
+ 
+        /* Schedule modal */
+        openNewSchedule({ date, start } = {}) {
+          const state = getState();
+          const nowMinutes = DateUtils.minutesSinceMidnight(state.now);
+          const startMinutes = start ?? Math.min(Math.ceil((nowMinutes + 1) / 60) * 60, 22 * 60);
+          setState({
+            modal: {
+              mode: 'create',
+              event: {
+                id: null,
+                title: '',
+                date: date ?? DateUtils.toKey(state.currentDate),
+                start: startMinutes,
+                end: Math.min(startMinutes + 60, 24 * 60),
+                calendarId: Selectors.allCalendars(state)[0]?.id ?? '',
+                guests: [],
+                link: '',
+              },
+            },
+          });
+        },
+        openEditSchedule: (event) => setState({ modal: { mode: 'edit', event } }),
+        closeModal: () => setState({ modal: null }),
+ 
+        saveEvent(data) {
+          setState((s) => {
+            const isEdit = Boolean(data.id) && s.events.some((e) => e.id === data.id);
+            const events = isEdit
+              ? s.events.map((e) => (e.id === data.id ? { ...e, ...data } : e))
+              : [...s.events, { ...data, id: createId() }];
+            const savedDate = DateUtils.fromKey(data.date);
+            return { events, modal: null, currentDate: savedDate, miniMonth: DateUtils.firstOfMonth(savedDate) };
+          });
+          actions.showToast('Schedule saved');
+        },
+        deleteEvent(eventId) {
+          setState((s) => ({ events: s.events.filter((e) => e.id !== eventId), modal: null }));
+          actions.showToast('Schedule deleted');
+        },
+ 
+        /* Feedback + time */
+        showToast(message) {
+          const id = ++toastCounter;
+          setState({ toast: { id, message } });
+          clearTimeout(toastTimer);
+          toastTimer = setTimeout(() => {
+            setState((s) => (s.toast?.id === id ? { toast: null } : {}));
+          }, CONFIG.TOAST_DURATION_MS);
+        },
+        tick: () => setState({ now: new Date() }),
+      };
+      return actions;
+    }
+ 
+    /* ================================================================
+       6. MODULE REGISTRY
+       ================================================================
+       A module is a plain object (see the how-to at the top). The
+       registry handles the boring plumbing so modules stay small:
+ 
+         - finds (or creates) the slot element
+         - calls `bind` ONCE   -> attach listeners with event delegation
+         - subscribes to the store and calls `render` when `deps` change
+         - shows/hides page modules that have a `route`
+ 
+       EVENT DELEGATION: we attach one listener to the slot and inspect
+       `event.target.closest('[data-...]')`. Because the slot element
+       itself is never replaced (only its innerHTML), listeners survive
+       every re-render. Attaching listeners to child elements would leak
+       or break each time the HTML is rebuilt.
+    */
+    const ModuleRegistry = {
+      modules: [],
+ 
+      register(...modules) {
+        modules.forEach((mod) => {
+          if (!mod.id || !mod.slot) throw new Error('A module needs an `id` and a `slot`.');
+          if (this.modules.some((m) => m.id === mod.id)) throw new Error(`Duplicate module id: ${mod.id}`);
+          this.modules.push(mod);
+        });
+        return this;
+      },
+ 
+      mountAll(ctx) {
+        this.modules.forEach((mod) => this.mount(mod, ctx));
+      },
+ 
+      mount(mod, ctx) {
+        let el = document.querySelector(mod.slot);
+ 
+        // Modules can create their own slot (used by page modules).
+        if (!el && mod.createIn) {
+          el = document.createElement(mod.tag ?? 'section');
+          el.id = mod.slot.replace(/^#/, '');
+          el.className = mod.slotClass ?? '';
+          document.querySelector(mod.createIn)?.appendChild(el);
+        }
+        if (!el) { console.warn(`[registry] Slot not found for "${mod.id}": ${mod.slot}`); return; }
+ 
+        let previousDeps = null;
+ 
+        const update = (state) => {
+          // `hidden` comes last in Tailwind's display utilities, so it wins over `flex`.
+          if (mod.route) el.classList.toggle('hidden', state.activeRoute !== mod.route);
+          if (!mod.render) return;
+ 
+          // Skip the render if none of the dependencies changed.
+          const deps = mod.deps ? mod.deps(state) : [state];
+          const unchanged = previousDeps
+            && deps.length === previousDeps.length
+            && deps.every((dep, i) => Object.is(dep, previousDeps[i]));
+          if (unchanged) return;
+          previousDeps = deps;
+ 
+          el.innerHTML = mod.render(state, ctx);
+          mod.afterRender?.(el, state, ctx);
+        };
+ 
+        mod.bind?.(el, ctx);
+        ctx.store.subscribe(update);
+        update(ctx.store.getState());
+      },
+    };
+ 
+    /* ================================================================
+       7. MODULES
+       ================================================================ */
+ 
+    /* ---------- 7.1 Navigation rail ---------- */
+    const NAV_ITEMS = [
+      { route: 'home',     label: 'Home',     icon: 'home' },
+      { route: 'calendar', label: 'Calendar', icon: 'calendar' },
+      { route: 'tasks',    label: 'Tasks',    icon: 'tasks' },
+      { route: 'timer',    label: 'Timer',    icon: 'timer' },
+      { route: 'settings', label: 'Settings', icon: 'settings' },
+    ];
+ 
+    const RailModule = {
+      id: 'rail',
+      slot: '#slot-rail',
+      deps: (s) => [s.activeRoute],
+      render(state) {
+        const buttonBase = 'flex h-10 w-10 items-center justify-center rounded-full transition-colors';
+        const navButtons = NAV_ITEMS.map((item) => {
+          const active = item.route === state.activeRoute;
+          const tone = active ? 'bg-white text-black' : 'bg-surface-raised text-ink-muted hover:text-ink';
+          return `
+            <button type="button" data-route="${item.route}" title="${item.label}" aria-label="${item.label}"
+                    ${active ? 'aria-current="page"' : ''} class="${buttonBase} ${tone}">
+              ${icon(item.icon)}
+            </button>`;
+        }).join('');
+ 
+        return `
+          <div class="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-accent text-sm font-bold text-black" aria-hidden="true">Y</div>
+          <div class="flex flex-row gap-2 md:flex-1 md:flex-col md:justify-center">${navButtons}</div>
+          <div class="ml-auto flex flex-row gap-2 md:ml-0 md:flex-col">
+            <button type="button" data-action="help" title="Help" aria-label="Help" class="${buttonBase} bg-surface-raised text-ink-muted hover:text-ink">${icon('help')}</button>
+            <button type="button" data-action="logout" title="Log out" aria-label="Log out" class="${buttonBase} bg-surface-raised text-ink-muted hover:text-ink">${icon('logout')}</button>
+          </div>`;
+      },
+      bind(el, { actions }) {
+        el.addEventListener('click', (e) => {
+          const routeButton = e.target.closest('[data-route]');
+          if (routeButton) return actions.navigate(routeButton.dataset.route);
+ 
+          const actionButton = e.target.closest('[data-action]');
+          if (actionButton?.dataset.action === 'help') actions.showToast('Connect your help centre here.');
+          if (actionButton?.dataset.action === 'logout') actions.showToast('Connect your sign-out flow here.');
+        });
+      },
+    };
+ 
+    /* ---------- 7.2 Workspace switcher ---------- */
+    const WorkspaceModule = {
+      id: 'workspace',
+      slot: '#slot-workspace',
+      deps: () => [], // static: renders once
+      render: () => `
+        <button type="button" class="flex w-full items-center gap-3 rounded-2xl bg-surface p-4 text-left">
+          <span class="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-white" aria-hidden="true">
+            <svg viewBox="0 0 24 24" class="h-6 w-6" fill="none" stroke="#111" stroke-width="2.5"><path d="M12 3l7.8 4.5v9L12 21l-7.8-4.5v-9z"/><circle cx="12" cy="12" r="2.5" fill="#111"/></svg>
+          </span>
+          <span class="min-w-0 flex-1">
+            <span class="block truncate text-base font-medium">Cronix Calendar</span>
+            <span class="block truncate text-sm text-ink-muted">My workspace</span>
+          </span>
+          <span class="text-ink-muted">${icon('chevronsUpDown', 'h-4 w-4')}</span>
+        </button>`,
+    };
+ 
+    /* ---------- 7.3 Mini calendar ---------- */
+    const MiniCalendarModule = {
+      id: 'mini-calendar',
+      slot: '#slot-mini-calendar',
+      deps: (s) => [s.miniMonth, s.currentDate, s.now],
+      render(state) {
+        const gridStart = DateUtils.startOfWeek(state.miniMonth);
+        const selectedKey = DateUtils.toKey(state.currentDate);
+        const todayKey = DateUtils.toKey(state.now);
+        const selectedWeekKey = DateUtils.toKey(DateUtils.startOfWeek(state.currentDate));
+        const weekdayLabels = ['Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa', 'Su'];
+ 
+        const weeks = Array.from({ length: 6 }, (_, w) =>
+          Array.from({ length: 7 }, (_, d) => DateUtils.addDays(gridStart, w * 7 + d)));
+ 
+        const rows = weeks.map((week) => {
+          const inSelectedWeek = DateUtils.toKey(week[0]) === selectedWeekKey;
+          const cells = week.map((date) => {
+            const key = DateUtils.toKey(date);
+            const inMonth = date.getMonth() === state.miniMonth.getMonth();
+            let tone = inMonth ? 'text-ink hover:bg-white/10' : 'text-ink-faint hover:bg-white/10';
+            if (key === todayKey) tone = 'font-medium text-accent hover:bg-white/10';
+            if (key === selectedKey) tone = 'bg-white font-medium text-black';
+            return `
+              <button type="button" data-date="${key}" aria-label="${DateUtils.formatLong(date)}"
+                      ${key === selectedKey ? 'aria-current="date"' : ''}
+                      class="mx-auto flex h-8 w-8 items-center justify-center rounded-full text-[13px] transition-colors ${tone}">
+                ${date.getDate()}
+              </button>`;
+          }).join('');
+          return `<div class="grid grid-cols-7 rounded-xl py-0.5 ${inSelectedWeek ? 'bg-white/[0.07]' : ''}">${cells}</div>`;
+        }).join('');
+ 
+        return `
+          <section class="rounded-2xl bg-surface p-4" aria-label="Month navigator">
+            <div class="mb-3 flex items-center justify-between">
+              <button type="button" data-mini-shift="-1" aria-label="Previous month" class="rounded-full p-1 text-ink-muted hover:text-ink">${icon('chevronLeft', 'h-4 w-4')}</button>
+              <h2 class="text-sm font-medium">${DateUtils.formatMonthYear(state.miniMonth)}</h2>
+              <button type="button" data-mini-shift="1" aria-label="Next month" class="rounded-full p-1 text-ink-muted hover:text-ink">${icon('chevronRight', 'h-4 w-4')}</button>
+            </div>
+            <div class="mb-1 grid grid-cols-7 text-center text-xs text-ink-muted" aria-hidden="true">
+              ${weekdayLabels.map((label) => `<span>${label}</span>`).join('')}
+            </div>
+            <div class="flex flex-col gap-0.5">${rows}</div>
+          </section>`;
+      },
+      bind(el, { actions }) {
+        el.addEventListener('click', (e) => {
+          const shiftButton = e.target.closest('[data-mini-shift]');
+          if (shiftButton) return actions.shiftMiniMonth(Number(shiftButton.dataset.miniShift));
+ 
+          const dayButton = e.target.closest('[data-date]');
+          if (dayButton) actions.selectDate(DateUtils.fromKey(dayButton.dataset.date));
+        });
+      },
+    };
+ 
+    /* ---------- 7.4 Calendar accounts ---------- */
+    const AccountsModule = {
+      id: 'accounts',
+      slot: '#slot-accounts',
+      deps: (s) => [s.accounts],
+      render(state) {
+        const accountCards = state.accounts.map((account) => {
+          const calendars = account.expanded ? `
+            <ul class="mt-3 flex flex-col gap-1">
+              ${account.calendars.map((cal) => `
+                <li>
+                  <button type="button" data-account="${esc(account.id)}" data-calendar="${esc(cal.id)}"
+                          aria-pressed="${cal.visible}"
+                          class="flex w-full items-center gap-3 rounded-lg px-1 py-1.5 text-left text-sm hover:bg-white/5 ${cal.visible ? 'text-ink' : 'text-ink-faint'}">
+                    <span class="h-3.5 w-3.5 shrink-0 rounded-[4px] border-2"
+                          style="border-color:${esc(cal.color)};background:${cal.visible ? esc(cal.color) : 'transparent'}"></span>
+                    <span class="truncate">${esc(cal.name)}</span>
+                  </button>
+                </li>`).join('')}
+            </ul>` : '';
+ 
+          return `
+            <div class="rounded-2xl bg-surface p-4">
+              <button type="button" data-toggle-account="${esc(account.id)}" aria-expanded="${account.expanded}"
+                      class="flex w-full items-center justify-between gap-2 text-left text-sm">
+                <span class="truncate">${esc(account.email)}</span>
+                <span class="text-ink-muted">${icon(account.expanded ? 'chevronUp' : 'chevronDown', 'h-4 w-4')}</span>
+              </button>
+              ${calendars}
+            </div>`;
+        }).join('');
+ 
+        return `
+          ${accountCards}
+          <button type="button" data-action="add-account"
+                  class="flex w-full items-center justify-center gap-2 rounded-2xl bg-surface-raised p-4 text-sm text-ink-muted hover:text-ink">
+            ${icon('plus', 'h-4 w-4')} Add calendar account
+          </button>`;
+      },
+      bind(el, { actions }) {
+        el.addEventListener('click', (e) => {
+          const accountToggle = e.target.closest('[data-toggle-account]');
+          if (accountToggle) return actions.toggleAccount(accountToggle.dataset.toggleAccount);
+ 
+          const calendarToggle = e.target.closest('[data-calendar]');
+          if (calendarToggle) return actions.toggleCalendar(calendarToggle.dataset.account, calendarToggle.dataset.calendar);
+ 
+          if (e.target.closest('[data-action="add-account"]')) actions.showToast('Connect your account-linking flow here.');
+        });
+      },
+    };
+ 
+    /* ---------- 7.5 Calendar header ---------- */
+    const CalendarHeaderModule = {
+      id: 'calendar-header',
+      slot: '#slot-calendar-header',
+      deps: (s) => [s.currentDate, s.view],
+      render(state) {
+        // View buttons are generated from the CalendarViews registry.
+        const viewButtons = Object.entries(CalendarViews).map(([id, view]) => {
+          const active = id === state.view;
+          return `
+            <button type="button" data-view="${id}" aria-pressed="${active}"
+                    class="rounded-lg px-3.5 py-1.5 transition-colors ${active ? 'bg-white font-medium text-black' : 'text-ink-muted hover:text-ink'}">
+              ${esc(view.label)}
+            </button>`;
+        }).join('');
+ 
+        const roundButton = 'flex h-9 w-9 items-center justify-center rounded-full border border-line bg-surface-raised text-ink-muted hover:text-ink';
+ 
+        return `
+          <div class="flex flex-wrap items-center gap-3 p-4 sm:p-5">
+            <h1 class="mr-2 text-2xl">${DateUtils.formatMonthYear(state.currentDate)}</h1>
+            <button type="button" data-action="today" class="rounded-xl border border-line bg-surface-raised px-4 py-2 text-sm hover:bg-white/10">Today</button>
+            <div class="flex gap-1">
+              <button type="button" data-shift="-1" aria-label="Previous" class="${roundButton}">${icon('chevronLeft', 'h-4 w-4')}</button>
+              <button type="button" data-shift="1" aria-label="Next" class="${roundButton}">${icon('chevronRight', 'h-4 w-4')}</button>
+            </div>
+            <div class="ml-auto flex items-center gap-3">
+              <div role="group" aria-label="Calendar view" class="flex rounded-xl bg-surface-sunken p-1 text-sm">${viewButtons}</div>
+              <button type="button" data-action="new"
+                      class="flex items-center gap-2 rounded-xl bg-accent px-4 py-2 text-sm font-medium text-black hover:brightness-95">
+                ${icon('plus', 'h-4 w-4')}<span class="hidden sm:inline">New schedule</span><span class="sr-only sm:hidden">New schedule</span>
+              </button>
+            </div>
+          </div>`;
+      },
+      bind(el, { actions }) {
+        el.addEventListener('click', (e) => {
+          const viewButton = e.target.closest('[data-view]');
+          if (viewButton) return actions.setView(viewButton.dataset.view);
+ 
+          const shiftButton = e.target.closest('[data-shift]');
+          if (shiftButton) return actions.shift(Number(shiftButton.dataset.shift));
+ 
+          const actionButton = e.target.closest('[data-action]');
+          if (actionButton?.dataset.action === 'today') actions.goToToday();
+          if (actionButton?.dataset.action === 'new') actions.openNewSchedule();
+        });
+      },
+    };
+ 
+    /* ---------- 7.6 Calendar body (renders the active view) ---------- */
+ 
+    /** One timed event block inside a day column. */
+    function renderTimedEvent({ event, lane, lanes }, calendar) {
+      const H = CONFIG.HOUR_HEIGHT;
+      const top = (event.start / 60) * H;
+      const height = Math.max(((event.end - event.start) / 60) * H, 24);
+      const width = 100 / lanes;
+      const compact = height < 52;
+      const range = `${DateUtils.formatTime(event.start)} - ${DateUtils.formatTime(event.end)}`;
+ 
+      return `
+        <button type="button" data-event-id="${esc(event.id)}"
+                aria-label="${esc(event.title)}, ${range}"
+                class="absolute overflow-hidden rounded-xl p-2 text-left text-xs leading-tight shadow-sm transition hover:brightness-110"
+                style="top:${top}px;height:${height - 2}px;left:calc(${lane * width}% + 2px);width:calc(${width}% - 4px);background:${esc(calendar?.color ?? '#888')};color:${CONFIG.EVENT_TEXT_COLOR}">
+          <span class="block truncate text-[13px] font-medium">${esc(event.title)}</span>
+          ${compact ? '' : `<span class="mt-1 block opacity-70">${range}</span>`}
+        </button>`;
+    }
+ 
+    /** Shared by Day and Week: a sticky header row + hour grid. */
+    function renderTimeGrid(state, days) {
+      const H = CONFIG.HOUR_HEIGHT;
+      const calendars = Selectors.calendarMap(state);
+      const byDate = Selectors.eventsByDate(state);
+      const columns = `${CONFIG.GUTTER_WIDTH} repeat(${days.length}, minmax(0, 1fr))`;
+      const minWidth = days.length > 1 ? '760px' : '320px';
+      const todayKey = DateUtils.toKey(state.now);
+      const nowMinutes = DateUtils.minutesSinceMidnight(state.now);
+      const showNow = days.some((d) => DateUtils.toKey(d) === todayKey);
+ 
+      const headerCells = days.map((date) => {
+        const key = DateUtils.toKey(date);
+        const isToday = key === todayKey;
+        return `
+          <button type="button" data-goto-day="${key}" aria-label="Open ${DateUtils.formatLong(date)}"
+                  class="border-l border-line px-2 py-3 text-center text-sm hover:bg-white/5 ${isToday ? 'font-medium text-accent' : 'text-ink'}">
+            ${DateUtils.formatWeekdayShort(date)} ${date.getDate()}
+          </button>`;
+      }).join('');
+ 
+      const hourLabels = Array.from({ length: 23 }, (_, i) => i + 1).map((hour) =>
+        `<span class="absolute right-2 -translate-y-1/2 text-xs text-ink-muted" style="top:${hour * H}px">${DateUtils.formatTime(hour * 60)}</span>`
+      ).join('');
+ 
+      const nowChip = showNow
+        ? `<span class="absolute right-1 z-10 -translate-y-1/2 rounded-md bg-surface-raised px-1.5 py-0.5 text-[11px] ring-1 ring-line" style="top:${(nowMinutes / 60) * H}px">${DateUtils.formatTime(nowMinutes)}</span>`
+        : '';
+ 
+      const dayColumns = days.map((date) => {
+        const key = DateUtils.toKey(date);
+        const isToday = key === todayKey;
+        const events = layoutOverlaps(byDate.get(key) ?? [])
+          .map((item) => renderTimedEvent(item, calendars.get(item.event.calendarId))).join('');
+        const nowLine = isToday
+          ? `<div class="pointer-events-none absolute inset-x-0 z-10 h-px bg-white" style="top:${(nowMinutes / 60) * H}px"></div>` : '';
+ 
+        // The hour lines are a CSS gradient: one element instead of 24 divs.
+        return `
+          <div data-column-date="${key}" class="relative border-l border-line ${isToday ? 'bg-white/[0.02]' : ''}"
+               style="background-image:repeating-linear-gradient(to bottom,transparent 0,transparent ${H - 1}px,var(--grid-line) ${H - 1}px,var(--grid-line) ${H}px)">
+            ${events}${nowLine}
+          </div>`;
+      }).join('');
+ 
+      return `
+        <div style="min-width:${minWidth}">
+          <div class="sticky top-0 z-30 grid border-b border-line bg-surface-raised" style="grid-template-columns:${columns}">
+            <div class="sticky left-0 z-10 flex items-center justify-center bg-surface-raised px-2 text-xs text-ink-muted">${DateUtils.gmtLabel()}</div>
+            ${headerCells}
+          </div>
+          <div class="relative grid" style="grid-template-columns:${columns};height:${24 * H}px">
+            <div class="sticky left-0 z-20 bg-surface">${hourLabels}${nowChip}</div>
+            ${dayColumns}
+          </div>
+        </div>`;
+    }
+ 
+    function renderMonth(state) {
+      const calendars = Selectors.calendarMap(state);
+      const byDate = Selectors.eventsByDate(state);
+      const gridStart = DateUtils.startOfWeek(DateUtils.firstOfMonth(state.currentDate));
+      const todayKey = DateUtils.toKey(state.now);
+      const days = Array.from({ length: 42 }, (_, i) => DateUtils.addDays(gridStart, i));
+      const MAX_VISIBLE = 3;
+ 
+      const weekdayHeader = days.slice(0, 7).map((d) =>
+        `<div class="border-l border-line py-3 text-center text-sm text-ink-muted first:border-l-0">${DateUtils.formatWeekdayShort(d)}</div>`).join('');
+ 
+      const cells = days.map((date) => {
+        const key = DateUtils.toKey(date);
+        const inMonth = date.getMonth() === state.currentDate.getMonth();
+        const events = byDate.get(key) ?? [];
+        const pills = events.slice(0, MAX_VISIBLE).map((event) => `
+          <button type="button" data-event-id="${esc(event.id)}"
+                  class="mb-1 block w-full truncate rounded-md px-1.5 py-0.5 text-left text-[11px] font-medium hover:brightness-110"
+                  style="background:${esc(calendars.get(event.calendarId)?.color ?? '#888')};color:${CONFIG.EVENT_TEXT_COLOR}">
+            ${esc(event.title)}
+          </button>`).join('');
+        const overflow = events.length > MAX_VISIBLE
+          ? `<button type="button" data-goto-day="${key}" class="text-[11px] text-ink-muted hover:text-ink">+${events.length - MAX_VISIBLE} more</button>` : '';
+        const dayTone = key === todayKey ? 'bg-accent font-medium text-black' : (inMonth ? 'text-ink' : 'text-ink-faint');
+ 
+        return `
+          <div data-cell-date="${key}" class="cursor-pointer border-b border-l border-line p-1.5 hover:bg-white/[0.03] ${inMonth ? '' : 'bg-black/20'}">
+            <button type="button" data-goto-day="${key}" aria-label="Open ${DateUtils.formatLong(date)}"
+                    class="mb-1 flex h-6 w-6 items-center justify-center rounded-full text-xs ${dayTone}">${date.getDate()}</button>
+            ${pills}${overflow}
+          </div>`;
+      }).join('');
+ 
+      return `
+        <div class="flex min-h-full flex-col" style="min-width:640px">
+          <div class="sticky top-0 z-30 grid grid-cols-7 border-b border-line bg-surface-raised">${weekdayHeader}</div>
+          <div class="grid flex-1 grid-cols-7" style="grid-auto-rows:minmax(6.5rem,1fr)">${cells}</div>
+        </div>`;
+    }
+ 
+    registerCalendarView('day', {
+      label: 'Day',
+      render: (state) => renderTimeGrid(state, [state.currentDate]),
+      shift: (date, dir) => DateUtils.addDays(date, dir),
+    });
+    registerCalendarView('week', {
+      label: 'Week',
+      render: (state) => renderTimeGrid(state, getWeekDays(state.currentDate)),
+      shift: (date, dir) => DateUtils.addDays(date, dir * 7),
+    });
+    registerCalendarView('month', {
+      label: 'Month',
+      render: renderMonth,
+      shift: (date, dir) => DateUtils.addMonthsClamped(date, dir),
+    });
+ 
+    const CalendarBodyModule = (() => {
+      let lastView = null; // remembered so we only reset scroll when the view changes
+ 
+      return {
+        id: 'calendar-body',
+        slot: '#slot-calendar-body',
+        deps: (s) => [s.currentDate, s.view, s.events, s.accounts, s.now],
+        render: (state) => CalendarViews[state.view].render(state),
+        afterRender(el, state) {
+          if (state.view !== lastView) {
+            el.scrollTop = state.view === 'month' ? 0 : CONFIG.DEFAULT_SCROLL_HOUR * CONFIG.HOUR_HEIGHT;
+            lastView = state.view;
+          }
+        },
+        bind(el, { store, actions }) {
+          el.addEventListener('click', (e) => {
+            // Order matters: the most specific targets are checked first.
+            const eventButton = e.target.closest('[data-event-id]');
+            if (eventButton) {
+              const found = store.getState().events.find((ev) => ev.id === eventButton.dataset.eventId);
+              if (found) actions.openEditSchedule(found);
+              return;
+            }
+ 
+            const dayButton = e.target.closest('[data-goto-day]');
+            if (dayButton) return actions.showDay(DateUtils.fromKey(dayButton.dataset.gotoDay));
+ 
+            // Clicking empty space in a time column creates an event at that time.
+            const column = e.target.closest('[data-column-date]');
+            if (column) {
+              const y = e.clientY - column.getBoundingClientRect().top;
+              const snapped = Math.floor(((y / CONFIG.HOUR_HEIGHT) * 60) / CONFIG.SNAP_MINUTES) * CONFIG.SNAP_MINUTES;
+              return actions.openNewSchedule({ date: column.dataset.columnDate, start: Math.min(snapped, 23 * 60 + 30) });
+            }
+ 
+            const cell = e.target.closest('[data-cell-date]');
+            if (cell) actions.openNewSchedule({ date: cell.dataset.cellDate, start: 9 * 60 });
+          });
+        },
+      };
+    })();
+ 
+    /* ---------- 7.7 Schedule modal (create / edit) ---------- */
+    const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+ 
+    const renderGuestChip = (email) => `
+      <span data-guest="${esc(email)}" class="inline-flex items-center gap-1 rounded-md bg-white/10 py-1 pl-2 pr-1 text-xs">
+        ${esc(email)}
+        <button type="button" data-remove-guest aria-label="Remove ${esc(email)}" class="rounded p-0.5 text-ink-muted hover:text-ink">${icon('close', 'h-3 w-3')}</button>
+      </span>`;
+ 
+    function renderTimeOptions(selected, min, max) {
+      const values = [];
+      for (let m = min; m <= max; m += CONFIG.SNAP_MINUTES) values.push(m);
+      if (!values.includes(selected)) { values.push(selected); values.sort((a, b) => a - b); }
+      return values.map((m) => `<option value="${m}" ${m === selected ? 'selected' : ''}>${DateUtils.formatTime(m)}</option>`).join('');
+    }
+ 
+    /** Small reusable helper: every form row shares the same look. */
+    const fieldRow = (iconName, inner, extraClasses = '') => `
+      <div class="flex items-center gap-3 rounded-xl border border-line bg-surface-sunken px-4 py-3 ${extraClasses}">
+        <span class="shrink-0 text-ink-muted">${icon(iconName, 'h-4 w-4')}</span>${inner}
+      </div>`;
+ 
+    const ModalModule = {
+      id: 'schedule-modal',
+      slot: '#slot-modal',
+      deps: (s) => [s.modal],
+      render(state) {
+        if (!state.modal) return '';
+        const { mode, event } = state.modal;
+        const calendars = Selectors.calendarMap(state);
+        const activeColor = calendars.get(event.calendarId)?.color ?? '#888';
+        const inputBase = 'w-full bg-transparent text-sm outline-none placeholder:text-ink-faint';
+ 
+        const calendarOptions = state.accounts.map((account) => `
+          <optgroup label="${esc(account.email)}">
+            ${account.calendars.map((cal) => `
+              <option value="${esc(cal.id)}" data-color="${esc(cal.color)}" ${cal.id === event.calendarId ? 'selected' : ''}>${esc(cal.name)}</option>`).join('')}
+          </optgroup>`).join('');
+ 
+        return `
+          <div data-modal-overlay class="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-black/60 p-4 backdrop-blur-sm">
+            <form id="schedule-form" novalidate role="dialog" aria-modal="true" aria-labelledby="modal-heading"
+                  class="my-auto w-full max-w-md rounded-3xl border border-line bg-surface p-6 shadow-2xl">
+              <div class="mb-4 flex items-center justify-between">
+                <h2 id="modal-heading" class="text-base font-medium">${mode === 'edit' ? 'Edit schedule' : 'Add schedule'}</h2>
+                <button type="button" data-close-modal aria-label="Close" class="rounded-full p-1 text-ink-muted hover:text-ink">${icon('close')}</button>
+              </div>
+ 
+              <label class="sr-only" for="field-title">Title</label>
+              <input id="field-title" name="title" type="text" value="${esc(event.title)}" placeholder="Add a title" autocomplete="off"
+                     class="mb-5 w-full bg-transparent text-3xl outline-none placeholder:text-ink-faint" />
+ 
+              <div class="flex flex-col gap-3">
+                ${fieldRow('calendarSmall', `<input name="date" type="date" required value="${esc(event.date)}" aria-label="Date" class="${inputBase}" />`)}
+ 
+                <div class="grid grid-cols-[1fr_auto_1fr] items-center gap-2">
+                  ${fieldRow('clock', `<select name="start" aria-label="Start time" class="${inputBase} appearance-none">${renderTimeOptions(event.start, 0, 23 * 60 + 30)}</select>`)}
+                  <span class="text-ink-muted">${icon('arrowRight', 'h-4 w-4')}</span>
+                  <div class="rounded-xl border border-line bg-surface-sunken px-4 py-3">
+                    <select name="end" aria-label="End time" class="${inputBase} appearance-none">${renderTimeOptions(event.end, CONFIG.SNAP_MINUTES, 24 * 60)}</select>
+                  </div>
+                </div>
+ 
+                ${fieldRow('user', `
+                  <div id="guest-field" class="flex flex-1 flex-wrap items-center gap-2">
+                    ${event.guests.map(renderGuestChip).join('')}
+                    <input id="guest-input" type="email" placeholder="Add guests" autocomplete="off" aria-label="Add guest email" class="min-w-[6rem] flex-1 ${inputBase}" />
+                  </div>`)}
+ 
+                ${fieldRow('link', `<input name="link" type="url" value="${esc(event.link)}" placeholder="Add a meeting link" aria-label="Meeting link" class="${inputBase}" />`)}
+ 
+                <div class="flex items-center gap-3 rounded-xl border border-line bg-surface-sunken px-4 py-3">
+                  <span id="calendar-dot" class="h-3 w-3 shrink-0 rounded-[3px]" style="background:${esc(activeColor)}"></span>
+                  <select name="calendarId" aria-label="Calendar" class="${inputBase} appearance-none">${calendarOptions}</select>
+                  <span class="text-ink-muted">${icon('chevronDown', 'h-4 w-4')}</span>
+                </div>
+              </div>
+ 
+              <p id="form-error" role="alert" class="mt-3 min-h-5 text-sm text-red-400"></p>
+ 
+              <div class="mt-2 flex items-center justify-between gap-2">
+                <div>${mode === 'edit' ? `<button type="button" data-delete-event class="flex items-center gap-2 rounded-xl px-3 py-2.5 text-sm text-red-400 hover:bg-red-400/10">${icon('trash', 'h-4 w-4')}Delete</button>` : ''}</div>
+                <div class="flex gap-2">
+                  <button type="button" data-close-modal class="rounded-xl border border-line px-5 py-2.5 text-sm hover:bg-white/5">Cancel</button>
+                  <button type="submit" class="rounded-xl bg-white px-5 py-2.5 text-sm font-medium text-black hover:bg-white/90">Save</button>
+                </div>
+              </div>
+            </form>
+          </div>`;
+      },
+ 
+      afterRender(el) {
+        el.querySelector('[name="title"]')?.focus();
+      },
+ 
+      bind(el, { store, actions }) {
+        const showError = (message) => {
+          const target = el.querySelector('#form-error');
+          if (target) target.textContent = message;
+        };
+ 
+        /** Turn whatever is typed in the guest box into a chip. Returns false if invalid. */
+        const commitGuestInput = () => {
+          const input = el.querySelector('#guest-input');
+          const email = input?.value.trim().replace(/,$/, '');
+          if (!email) return true;
+          if (!EMAIL_PATTERN.test(email)) { showError(`"${email}" is not a valid email address.`); return false; }
+          const alreadyAdded = [...el.querySelectorAll('[data-guest]')].some((chip) => chip.dataset.guest === email);
+          if (!alreadyAdded) input.insertAdjacentHTML('beforebegin', renderGuestChip(email));
+          input.value = '';
+          showError('');
+          return true;
+        };
+ 
+        el.addEventListener('click', (e) => {
+          if (e.target.closest('[data-close-modal]') || e.target.matches('[data-modal-overlay]')) return actions.closeModal();
+ 
+          const removeGuest = e.target.closest('[data-remove-guest]');
+          if (removeGuest) return removeGuest.closest('[data-guest]').remove();
+ 
+          if (e.target.closest('[data-delete-event]')) {
+            const { modal } = store.getState();
+            if (modal?.event.id) actions.deleteEvent(modal.event.id);
+          }
+        });
+ 
+        el.addEventListener('keydown', (e) => {
+          if (e.target.id === 'guest-input' && (e.key === 'Enter' || e.key === ',')) {
+            e.preventDefault(); // Enter must not submit the whole form
+            commitGuestInput();
+          }
+        });
+ 
+        el.addEventListener('change', (e) => {
+          if (e.target.name === 'calendarId') {
+            const color = e.target.selectedOptions[0]?.dataset.color;
+            const dot = el.querySelector('#calendar-dot');
+            if (dot && color) dot.style.background = color;
+          }
+        });
+ 
+        el.addEventListener('submit', (e) => {
+          e.preventDefault();
+          if (!commitGuestInput()) return;
+ 
+          const form = e.target;
+          const data = new FormData(form);
+          const title = String(data.get('title') ?? '').trim();
+          const date = String(data.get('date') ?? '');
+          const start = Number(data.get('start'));
+          const end = Number(data.get('end'));
+          const link = String(data.get('link') ?? '').trim();
+ 
+          // Validate on the way in, and tell the user exactly what to fix.
+          if (!title) return showError('Add a title before saving.');
+          if (!date) return showError('Choose a date.');
+          if (end <= start) return showError('The end time must be after the start time.');
+          if (link && !/^https?:\/\//i.test(link)) return showError('The meeting link must start with http:// or https://.');
+ 
+          actions.saveEvent({
+            id: store.getState().modal?.event.id ?? null,
+            title, date, start, end, link,
+            calendarId: String(data.get('calendarId')),
+            guests: [...form.querySelectorAll('[data-guest]')].map((chip) => chip.dataset.guest),
+          });
+        });
+ 
+        // Escape closes the dialog from anywhere.
+        document.addEventListener('keydown', (e) => {
+          if (e.key === 'Escape' && store.getState().modal) actions.closeModal();
+        });
+      },
+    };
+ 
+    /* ---------- 7.8 Toast ---------- */
+    const ToastModule = {
+      id: 'toast',
+      slot: '#slot-toast',
+      deps: (s) => [s.toast],
+      render: (state) => state.toast
+        ? `<div class="rounded-xl bg-white px-4 py-3 text-sm font-medium text-black shadow-lg">${esc(state.toast.message)}</div>`
+        : '',
+    };
+ 
+    /* ---------- 7.9 Pages ---------- */
+ 
+    /** The calendar page is static HTML; this module only toggles its visibility by route. */
+    const CalendarPageModule = { id: 'page-calendar', slot: '#page-calendar', route: 'calendar' };
+ 
+    /** Home: a real page module that reuses selectors. Shows today's agenda. */
+    const HomePageModule = {
+      id: 'page-home',
+      slot: '#page-home',
+      createIn: '#slot-pages',
+      slotClass: 'h-full overflow-auto rounded-2xl bg-surface p-6 sm:p-8',
+      route: 'home',
+      deps: (s) => [s.events, s.accounts, s.now],
+      render(state) {
+        const calendars = Selectors.calendarMap(state);
+        const todayEvents = Selectors.eventsByDate(state).get(DateUtils.toKey(state.now)) ?? [];
+ 
+        const agenda = todayEvents.length
+          ? `<ul class="mt-6 flex max-w-xl flex-col gap-2">
+              ${todayEvents.map((event) => `
+                <li class="flex items-center gap-4 rounded-xl bg-surface-raised px-4 py-3">
+                  <span class="h-8 w-1.5 shrink-0 rounded-full" style="background:${esc(calendars.get(event.calendarId)?.color ?? '#888')}"></span>
+                  <span class="min-w-0 flex-1">
+                    <span class="block truncate text-sm font-medium">${esc(event.title)}</span>
+                    <span class="block text-xs text-ink-muted">${DateUtils.formatTime(event.start)} - ${DateUtils.formatTime(event.end)}</span>
+                  </span>
+                </li>`).join('')}
+            </ul>`
+          : `<div class="mt-6 max-w-xl rounded-xl border border-dashed border-line p-6 text-sm text-ink-muted">
+              Nothing is scheduled today.
+              <button type="button" data-action="new" class="ml-1 text-accent underline underline-offset-4">Add a schedule</button>
+            </div>`;
+ 
+        return `
+          <h1 class="text-2xl">Today</h1>
+          <p class="text-sm text-ink-muted">${DateUtils.formatAgendaDate(state.now)}</p>
+          ${agenda}`;
+      },
+      bind(el, { actions }) {
+        el.addEventListener('click', (e) => {
+          if (e.target.closest('[data-action="new"]')) actions.openNewSchedule();
+        });
+      },
+    };
+ 
+    /**
+     * Factory function: one function that makes many similar modules.
+     * Use this pattern whenever you'd otherwise copy-paste a module.
+     */
+    function createPlaceholderPage({ route, title, description }) {
+      return {
+        id: `page-${route}`,
+        slot: `#page-${route}`,
+        createIn: '#slot-pages',
+        slotClass: 'flex h-full flex-col items-center justify-center gap-2 rounded-2xl bg-surface p-8 text-center',
+        route,
+        deps: () => [],
+        render: () => `
+          <h1 class="text-2xl">${esc(title)}</h1>
+          <p class="max-w-sm text-sm text-ink-muted">${esc(description)}</p>`,
+      };
+    }
+ 
+    /* ================================================================
+       8. BOOTSTRAP: wire everything together
+       ================================================================ */
+    function bootstrap() {
+      const store = createStore(createInitialState());
+      const actions = createActions(store);
+      const ctx = { store, actions }; // handed to every module
+ 
+      // >>> ADD NEW MODULES TO THIS LIST <<<
+      ModuleRegistry.register(
+        RailModule,
+        WorkspaceModule,
+        MiniCalendarModule,
+        AccountsModule,
+        CalendarPageModule,
+        CalendarHeaderModule,
+        CalendarBodyModule,
+        HomePageModule,
+        createPlaceholderPage({ route: 'tasks',    title: 'Tasks',    description: 'Your task list will live here. Register a new module to build it.' }),
+        createPlaceholderPage({ route: 'timer',    title: 'Timer',    description: 'A focus timer can live here. Register a new module to build it.' }),
+        createPlaceholderPage({ route: 'settings', title: 'Settings', description: 'Preferences will live here. Register a new module to build it.' }),
+        ModalModule,
+        ToastModule,
+      );
+ 
+      // Save only when the data we care about actually changed.
+      let lastSaved = { events: store.getState().events, accounts: store.getState().accounts };
+      store.subscribe((state) => {
+        if (state.events !== lastSaved.events || state.accounts !== lastSaved.accounts) {
+          lastSaved = { events: state.events, accounts: state.accounts };
+          Persistence.save(lastSaved);
+        }
+      });
+ 
+      ModuleRegistry.mountAll(ctx);
+      setInterval(actions.tick, CONFIG.TICK_INTERVAL_MS); // move the "now" line
+    }
+ 
+    bootstrap();
+  })();
+  </script>
+</body>
+</html>
+ 
