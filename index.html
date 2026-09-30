@@ -99,6 +99,25 @@
     [data-rich-editor] a { color: #d6ff3d; text-decoration: underline; text-underline-offset: 2px; cursor: text; }
     [data-rich-toolbar] button[aria-pressed="true"] { background: rgb(255 255 255 / 0.12); color: #f4f4f5; }
 
+    /* Expanded (Notion-style) schedule page: the description box is reused inside it, so restyle it there. */
+    [data-peek-panel] [data-peek-open] { display: none; }
+    [data-peek-panel] [data-desc-box] { background: transparent; }
+    [data-peek-panel] [data-desc-box]:not(:focus-within) { border-color: transparent; }
+    [data-peek-panel] [data-rich-editor] { max-height: none; min-height: 16rem; font-size: 0.9375rem; }
+    [data-peek-panel] [data-rich-toolbar] { opacity: 0.55; transition: opacity 150ms; }
+    [data-peek-panel] [data-desc-box]:hover [data-rich-toolbar],
+    [data-peek-panel] [data-desc-box]:focus-within [data-rich-toolbar] { opacity: 1; }
+
+    /* Small dark tooltip, like Notion's "Open in full page  Ctrl+Enter" chip. */
+    [data-tip] { position: relative; }
+    [data-tip]:hover::after, [data-tip]:focus-visible::after {
+      content: attr(data-tip); position: absolute; top: calc(100% + 6px); right: 0; z-index: 70;
+      white-space: pre; pointer-events: none; padding: 6px 9px; border-radius: 8px;
+      background: #0c0c0d; border: 1px solid #2a2a2e; color: #f4f4f5; font-size: 12px; line-height: 1.35; text-align: left;
+      box-shadow: 0 8px 24px rgb(0 0 0 / 0.5);
+    }
+    [data-tip][data-tip-align="left"]:hover::after, [data-tip][data-tip-align="left"]:focus-visible::after { right: auto; left: 0; }
+
     /* Respect users who ask their OS to minimise animation. */
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
@@ -498,6 +517,13 @@
       listBullet: '<path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/>',
       removeFormat: '<path d="M4 7V4h16v3M5 20h6M13 4 8 20M15 15l5 5M20 15l-5 5"/>',
       file: '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/>',
+      expand: '<path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/>',
+      collapse: '<path d="M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7"/>',
+      tag: '<path d="M20.6 13.4l-7.2 7.2a2 2 0 0 1-2.8 0L3 13V3h10l7.6 7.6a2 2 0 0 1 0 2.8z"/><path d="M7.5 7.5h.01"/>',
+      mapPin: '<path d="M20 10c0 6-8 12-8 12S4 16 4 10a8 8 0 0 1 16 0z"/><circle cx="12" cy="10" r="3"/>',
+      checkSquare: '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="m9 12 2 2 4-4"/>',
+      globe: '<circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15 15 0 0 1 0 20M12 2a15 15 0 0 0 0 20"/>',
+      copy: '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
     };
 
     const icon = (name, classes = 'h-5 w-5') =>
@@ -2787,7 +2813,7 @@
       const divider = '<span class="mx-1.5 h-5 w-px bg-line" aria-hidden="true"></span>';
 
       return `
-        <div class="rounded-xl border border-line bg-surface-sunken transition-colors focus-within:border-accent/70">
+        <div data-desc-box class="rounded-xl border border-line bg-surface-sunken transition-colors focus-within:border-accent/70">
           <div role="toolbar" aria-label="Description formatting" data-rich-toolbar class="flex flex-wrap items-center px-3 pt-2">
             ${tool('drive', 'Attach from Google Drive', 'drive')}
             ${divider}
@@ -2800,6 +2826,8 @@
             ${divider}
             ${tool('link', 'Insert link (Ctrl+K)', 'link')}
             ${tool('clear', 'Clear formatting', 'removeFormat')}
+            <button type="button" data-peek-open aria-label="Open in expanded view" data-tip="Open in expanded view&#10;Ctrl+↵"
+                    class="ml-auto flex h-8 w-8 items-center justify-center rounded-lg text-ink-muted transition-colors hover:bg-white/5 hover:text-ink">${icon('expand', 'h-4 w-4')}</button>
           </div>
           <div data-rich-panel class="mx-3 mt-2 hidden flex-wrap items-center gap-2 rounded-lg border border-line bg-surface px-3 py-2"></div>
           <div id="field-description" data-rich-editor contenteditable="true" role="textbox" aria-multiline="true" aria-label="Description"
@@ -3599,7 +3627,7 @@
             id: store.getState().modal?.event.id ?? null,
             title, date, start, end, allDay, link,
             description: sanitizeRichText(editorEl()?.innerHTML ?? ''),
-            attachments: [...form.querySelectorAll('[data-attachment]')].map((chip) => ({
+            attachments: [...el.querySelectorAll('[data-attachment]')].map((chip) => ({
               fileId: chip.dataset.fileId, fileUrl: chip.dataset.fileUrl, title: chip.dataset.title,
               mimeType: chip.dataset.mime, iconLink: chip.dataset.icon,
             })),
@@ -3607,6 +3635,249 @@
             guests: [...form.querySelectorAll('[data-guest]')].map((chip) => chip.dataset.guest),
           });
         });
+
+        /* ---------- Expanded, Notion-style schedule page ----------
+           The description box is MOVED (not copied) into a wide page, so the editor, toolbar, link box and
+           Drive attachments keep working with the handlers above. Everything else is shown as Notion-style
+           property rows; clicking a row returns to the form with that field focused. */
+        const PEEK_MS = 360;
+        const reducedMotion = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
+        let peek = null; // { overlay, panel, box, placeholder, closing }
+        const peekAlive = () => Boolean(peek && peek.overlay.isConnected);
+
+        const PEEK_FOCUS = {
+          title: '#field-title', date: 'input[name="dateText"]', time: 'input[name="start"]', allDay: 'input[name="allDay"]',
+          guests: '#guest-input', link: 'input[name="link"]', purpose: '[data-purpose-button]',
+        };
+
+        const peekRow = (iconName, label, valueHtml, focusKey) => `
+          <div ${focusKey ? `data-peek-focus="${focusKey}" role="button" tabindex="0" title="Edit ${esc(label.toLowerCase())}"` : ''}
+               class="flex items-start gap-2 rounded-md px-1.5 py-1.5 transition-colors ${focusKey ? 'cursor-pointer hover:bg-white/5' : ''}">
+            <div class="flex w-40 shrink-0 items-center gap-2 py-0.5 text-sm text-ink-muted">
+              <span class="shrink-0">${icon(iconName, 'h-4 w-4')}</span><span class="truncate">${esc(label)}</span>
+            </div>
+            <div class="min-w-0 flex-1 py-0.5 text-sm">${valueHtml}</div>
+          </div>`;
+        const emptyValue = '<span class="text-ink-faint">Empty</span>';
+        const pill = (inner, style = '') =>
+          `<span class="inline-flex max-w-full items-center gap-1.5 rounded-md bg-white/10 px-2 py-0.5 text-[13px]" style="${style}">${inner}</span>`;
+
+        /** Read the CURRENT form (including unsaved edits) and lay it out like a Notion page. */
+        function peekMarkup() {
+          const { modal } = store.getState();
+          const event = modal?.event ?? {};
+          const val = (selector) => el.querySelector(selector)?.value ?? '';
+
+          const title = val('#field-title');
+          const dateKey = dateValue()?.value;
+          const dateText = dateKey
+            ? DateUtils.fromKey(dateKey).toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })
+            : '';
+          const allDay = Boolean(el.querySelector('input[name="allDay"]')?.checked);
+
+          const startText = val('input[name="start"]').trim();
+          const endText = val('input[name="end"]').trim();
+          const from = readMinutes('start');
+          const to = readMinutes('end');
+          let duration = '';
+          if (from != null && to != null && to > from) {
+            const d = to - from;
+            duration = [Math.floor(d / 60) ? `${Math.floor(d / 60)}h` : '', d % 60 ? `${d % 60}m` : ''].filter(Boolean).join(' ');
+          }
+          const timeHtml = allDay
+            ? pill('All day')
+            : (startText || endText)
+              ? `${esc(startText)} <span class="mx-1 text-ink-muted">→</span> ${esc(endText)}${duration ? `<span class="ml-2 text-ink-faint">${duration}</span>` : ''}`
+              : emptyValue;
+
+          const purposeName = el.querySelector('[data-purpose-label]')?.textContent.trim() ?? '';
+          const purposeColor = el.querySelector('[data-purpose-dot]')?.style.backgroundColor || '#888';
+          const purposeHtml = purposeName
+            ? pill(`<span class="h-2 w-2 shrink-0 rounded-full" style="background:${esc(purposeColor)}"></span><span class="truncate">${esc(purposeName)}</span>`,
+                `background:color-mix(in srgb, ${esc(purposeColor)} 26%, transparent)`)
+            : emptyValue;
+
+          const guests = [...el.querySelectorAll('[data-guest]')].map((chip) => chip.dataset.guest);
+          const typedGuest = val('#guest-input').trim();
+          if (typedGuest) guests.push(typedGuest);
+          const guestsHtml = guests.length
+            ? `<div class="flex flex-wrap gap-1.5">${guests.map((email) => `
+                <span class="inline-flex max-w-full items-center gap-1.5 rounded-full bg-white/10 py-0.5 pl-0.5 pr-2.5 text-[13px]">
+                  <span class="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-white/15 text-[10px] font-medium uppercase">${esc(email[0] ?? '?')}</span>
+                  <span class="truncate">${esc(email)}</span>
+                </span>`).join('')}</div>`
+            : emptyValue;
+
+          const link = val('input[name="link"]').trim();
+          const linkHtml = !link ? emptyValue
+            : /^https?:\/\//i.test(link)
+              ? `<a href="${esc(link)}" target="_blank" rel="noopener noreferrer" class="block truncate underline decoration-white/30 underline-offset-2 hover:decoration-white">${esc(link)}</a>`
+              : `<span class="block truncate">${esc(link)}</span>`;
+
+          const place = event.gx?.place ?? '';
+          const source = event.onGoogle ? 'Google Calendar' : 'Taskly';
+          const rows = [
+            peekRow('calendarSmall', 'Date', dateText ? esc(dateText) : emptyValue, 'date'),
+            peekRow('clock', 'Time', timeHtml, 'time'),
+            peekRow('checkSquare', 'All day', `<span class="inline-flex items-center gap-2"><span class="flex h-4 w-4 items-center justify-center rounded border ${allDay ? 'border-accent bg-accent text-black' : 'border-white/30'}">${allDay ? icon('check', 'h-3 w-3') : ''}</span>${allDay ? 'Yes' : 'No'}</span>`, 'allDay'),
+            peekRow('tag', 'Purpose', purposeHtml, 'purpose'),
+            peekRow('user', 'Guests', guestsHtml, 'guests'),
+            peekRow('link', 'Meeting link', linkHtml, 'link'),
+            place ? peekRow('mapPin', 'Location', esc(place)) : '',
+            peekRow('globe', 'Source', event.onGoogle
+              ? `${pill('Google Calendar')}${event.readOnly ? '<span class="ml-2 text-ink-faint">Read-only</span>' : ''}`
+              : pill('Taskly')),
+            event.htmlLink
+              ? peekRow('link', 'Open in', `<a href="${esc(event.htmlLink)}" target="_blank" rel="noopener noreferrer" class="underline decoration-white/30 underline-offset-2 hover:decoration-white">Google Calendar</a>`)
+              : '',
+          ].join('');
+
+          const headerDate = dateKey ? DateUtils.fromKey(dateKey).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '';
+          const iconButton = 'flex h-8 w-8 items-center justify-center rounded-md text-ink-muted transition-colors hover:bg-white/10 hover:text-ink';
+
+          return `
+            <div data-peek-overlay class="fixed inset-0 z-[55] flex items-center justify-center bg-black/55 p-3 backdrop-blur-sm sm:p-8">
+              <div data-peek-panel role="dialog" aria-modal="true" aria-label="Schedule details" tabindex="-1"
+                   class="relative flex h-full max-h-[900px] w-full max-w-[920px] flex-col overflow-hidden rounded-2xl border border-line bg-surface-raised shadow-2xl shadow-black/70 outline-none">
+                <div class="flex shrink-0 items-center justify-between gap-2 px-4 py-3">
+                  <div class="flex min-w-0 items-center gap-2">
+                    <button type="button" data-peek-close aria-label="Collapse" data-tip="Collapse&#10;Esc" data-tip-align="left" class="${iconButton}">${icon('collapse', 'h-4 w-4')}</button>
+                    <span class="h-4 w-px bg-line" aria-hidden="true"></span>
+                    <span class="truncate text-sm text-ink-muted">${modal?.mode === 'edit' ? 'Edit schedule' : 'New schedule'}${headerDate ? ` · ${esc(headerDate)}` : ''}</span>
+                  </div>
+                  <div class="flex items-center gap-1">
+                    ${/^https?:\/\//i.test(link) ? `<button type="button" data-peek-copy aria-label="Copy meeting link" data-tip="Copy meeting link" class="${iconButton}">${icon('copy', 'h-4 w-4')}</button>` : ''}
+                    <button type="button" data-peek-close aria-label="Close" class="${iconButton}">${icon('close', 'h-4 w-4')}</button>
+                  </div>
+                </div>
+                <div class="min-h-0 flex-1 overflow-y-auto">
+                  <div class="mx-auto w-full max-w-[720px] px-6 pb-20 pt-8 sm:px-10">
+                    <input id="peek-title" type="text" value="${esc(title)}" placeholder="Untitled" autocomplete="off" aria-label="Title"
+                           class="w-full bg-transparent text-4xl font-bold leading-tight outline-none placeholder:text-ink-faint" />
+                    <div class="mt-5 flex flex-col gap-0.5">${rows}</div>
+                    <div class="my-6 h-px bg-line" aria-hidden="true"></div>
+                    <div class="mb-2 flex items-center gap-2 px-1.5 text-sm text-ink-muted">${icon('description', 'h-4 w-4')}Description</div>
+                    <div data-peek-desc></div>
+                  </div>
+                </div>
+              </div>
+            </div>`;
+        }
+
+        /** Grow from (or shrink back to) the description box: the page is revealed through a clip that morphs, so text never stretches. */
+        function animatePeek(box, opening) {
+          const { overlay, panel } = peek;
+          const to = panel.getBoundingClientRect();
+          const inset = (r) => `inset(${Math.max(0, r.top - to.top)}px ${Math.max(0, to.right - r.right)}px ${Math.max(0, to.bottom - r.bottom)}px ${Math.max(0, r.left - to.left)}px round 12px)`;
+          const small = inset(box);
+          const full = 'inset(0px 0px 0px 0px round 16px)';
+          const duration = reducedMotion() ? 0 : PEEK_MS;
+          const fade = overlay.animate(opening ? [{ opacity: 0 }, { opacity: 1 }] : [{ opacity: 1 }, { opacity: 0 }], { duration, easing: 'ease', fill: 'both' });
+          const grow = panel.animate(opening ? [{ clipPath: small }, { clipPath: full }] : [{ clipPath: full }, { clipPath: small }],
+            { duration, easing: 'cubic-bezier(0.22, 1, 0.36, 1)', fill: 'both' });
+          return Promise.all([fade.finished, grow.finished]).then(() => {
+            if (opening) { fade.cancel(); grow.cancel(); } // release the clip so the panel's shadow shows again
+          }).catch(() => {});
+        }
+
+        function openPeek({ focusEditor = false } = {}) {
+          if (peek && !peekAlive()) peek = null;
+          if (peek) return;
+          const box = el.querySelector('[data-desc-box]');
+          if (!box) return;
+          const from = box.getBoundingClientRect();
+          el.insertAdjacentHTML('beforeend', peekMarkup());
+          const overlay = el.querySelector('[data-peek-overlay]');
+          const panel = overlay.querySelector('[data-peek-panel]');
+          const placeholder = document.createElement('div'); // keeps the form's layout from jumping while the box is away
+          placeholder.style.height = `${from.height}px`;
+          box.replaceWith(placeholder);
+          overlay.querySelector('[data-peek-desc]').append(box);
+          peek = { overlay, panel, box, placeholder, closing: false };
+          syncEditor();
+          const editor = editorEl();
+          if (focusEditor && editor) {
+            editor.focus({ preventScroll: true });
+            const range = document.createRange();
+            range.selectNodeContents(editor);
+            range.collapse(false);
+            const selection = getSelection();
+            selection.removeAllRanges();
+            selection.addRange(range);
+          } else {
+            panel.focus({ preventScroll: true });
+          }
+          animatePeek(from, true);
+        }
+
+        async function closePeek({ restoreFocus = true } = {}) {
+          if (!peek) return;
+          if (!peekAlive()) { peek = null; return; }
+          if (peek.closing) return;
+          peek.closing = true;
+          const { overlay, box, placeholder } = peek;
+          if (panelMode) closePanel({ restore: false });
+          await animatePeek(placeholder.getBoundingClientRect(), false);
+          if (placeholder.isConnected) placeholder.replaceWith(box);
+          overlay.remove();
+          peek = null;
+          syncEditor();
+          if (restoreFocus) el.querySelector('[data-peek-open]')?.focus({ preventScroll: true });
+        }
+
+        async function focusFromPeek(key) {
+          await closePeek({ restoreFocus: false });
+          el.querySelector(PEEK_FOCUS[key] ?? '')?.focus();
+        }
+
+        el.addEventListener('click', (e) => {
+          if (e.target.closest('[data-peek-open]')) return openPeek();
+          if (!peekAlive()) return;
+          if (e.target.closest('[data-peek-close]') || e.target.matches('[data-peek-overlay]')) return closePeek();
+          if (e.target.closest('[data-peek-copy]')) {
+            const link = el.querySelector('input[name="link"]')?.value.trim();
+            if (link) navigator.clipboard?.writeText(link).then(() => actions.showToast('Meeting link copied'), () => {});
+            return;
+          }
+          const row = e.target.closest('[data-peek-focus]');
+          if (row && !e.target.closest('a')) focusFromPeek(row.dataset.peekFocus);
+        });
+
+        // The big title in the expanded page edits the same title as the form.
+        el.addEventListener('input', (e) => {
+          if (e.target.id !== 'peek-title') return;
+          const formTitle = el.querySelector('#field-title');
+          if (formTitle) formTitle.value = e.target.value;
+        });
+
+        el.addEventListener('keydown', (e) => {
+          // Ctrl/Cmd+Enter toggles the expanded page, like Notion's "Open in full page".
+          if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+            if (peekAlive()) { e.preventDefault(); closePeek(); }
+            else if (e.target.closest?.('[data-rich-editor]')) { e.preventDefault(); openPeek({ focusEditor: true }); }
+            return;
+          }
+          if (!peekAlive()) return;
+          if (e.target.id === 'peek-title' && e.key === 'Enter') { e.preventDefault(); editorEl()?.focus(); return; }
+          const row = e.target.closest?.('[data-peek-focus]');
+          if (row && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); focusFromPeek(row.dataset.peekFocus); return; }
+          if (e.key === 'Tab') { // keep keyboard focus inside the page while it is open
+            const focusable = [...peek.panel.querySelectorAll('button, a[href], input, [tabindex="0"], [contenteditable="true"]')]
+              .filter((node) => !node.disabled && node.offsetParent !== null);
+            if (!focusable.length) return;
+            const i = focusable.indexOf(document.activeElement);
+            const next = focusable[(i + (e.shiftKey ? -1 : 1) + focusable.length) % focusable.length];
+            if (i === -1 || (e.shiftKey && i === 0) || (!e.shiftKey && i === focusable.length - 1)) { e.preventDefault(); next.focus(); }
+          }
+        });
+
+        // Escape collapses the page first (capture phase, so the dialog underneath is not closed too).
+        // Inside the link/Drive box, Escape only closes that box, as before.
+        document.addEventListener('keydown', (e) => {
+          if (e.key !== 'Escape' || !peekAlive() || e.target.closest?.('[data-rich-panel]')) return;
+          e.stopPropagation();
+          closePeek();
+        }, true);
 
         // Escape closes the dialog from anywhere.
         document.addEventListener('keydown', (e) => {
