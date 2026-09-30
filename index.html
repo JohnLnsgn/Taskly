@@ -4,6 +4,8 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Taskly</title>
+  <link rel="icon" type="image/png" href="favicon.png" />
+  <link rel="apple-touch-icon" href="favicon.png" />
 
   <!--
     ============================================================
@@ -2256,9 +2258,10 @@ const createPurposeCalendars = () => [...PURPOSES.map((purpose) => ({ ...purpose
         }).join('');
 
         return `
+          <img src="logo.png" alt="Taskly" width="40" height="47" class="h-10 w-auto shrink-0 select-none object-contain" draggable="false" />
           <button type="button" data-open-account data-account-anchor aria-haspopup="menu"
                   aria-label="${state.activeUserId ? 'Account menu' : 'Sign in'}" title="${state.activeUserId ? 'Account' : 'Sign in'}"
-                  class="shrink-0 rounded-full">
+                  class="shrink-0 rounded-full lg:hidden">
             ${renderAvatar(Selectors.activeUser(state))}
           </button>
           <div class="flex flex-row gap-2 md:flex-1 md:flex-col md:justify-center">${navButtons}</div>
@@ -2370,7 +2373,8 @@ const createPurposeCalendars = () => [...PURPOSES.map((purpose) => ({ ...purpose
         return `
           <div data-account-anchor class="flex items-center gap-2 rounded-2xl bg-surface p-4">
             <button type="button" data-open-account aria-haspopup="menu" aria-expanded="${Boolean(state.accountMenu)}"
-                    class="flex min-w-0 flex-1 items-center gap-3 text-left">   
+                    class="flex min-w-0 flex-1 items-center gap-3 text-left">
+              ${renderAvatar(user, 'h-10 w-10')}
               <span class="min-w-0 flex-1">
                 <span class="block truncate text-base font-medium">Taskly</span>
                 <span class="block truncate text-sm text-ink-muted">${esc(firstName)}'s workspace</span>
