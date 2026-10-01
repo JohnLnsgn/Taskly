@@ -142,6 +142,17 @@
     [data-desc-box].ro-field [data-rich-editor] { cursor: default; }
     input:disabled, button:disabled { cursor: not-allowed; }
 
+    /* Dragging a task to another day on the calendar. */
+    [data-draggable] { cursor: grab; }
+    [data-event-id].is-dragging { opacity: 0.3; }
+    .drop-target { background-color: rgb(214 255 61 / 0.1) !important; box-shadow: inset 0 0 0 2px rgb(214 255 61 / 0.75); }
+    .drag-ghost { position: fixed; z-index: 80; margin: 0 !important; pointer-events: none; transform: rotate(1.5deg) scale(1.03);
+      box-shadow: 0 14px 30px rgb(0 0 0 / 0.55); opacity: 0.95; transition: none !important; }
+    .drag-label { position: fixed; z-index: 81; pointer-events: none; white-space: nowrap; padding: 5px 10px; border-radius: 999px;
+      background: #0c0c0d; border: 1px solid #2a2a2e; color: #f4f4f5; font-size: 12px; box-shadow: 0 8px 24px rgb(0 0 0 / 0.5); }
+    .drag-label[data-valid] { background: #d6ff3d; border-color: #d6ff3d; color: #09090a; font-weight: 500; }
+    body.dragging-task, body.dragging-task * { cursor: grabbing !important; user-select: none !important; }
+
     /* Small dark tooltip, like Notion's "Open in full page  Ctrl+Enter" chip. */
     [data-tip] { position: relative; }
     [data-tip]:hover::after, [data-tip]:focus-visible::after {
@@ -2030,6 +2041,19 @@ const createPurposeCalendars = () => [...PURPOSES.map((purpose) => ({ ...purpose
           actions.showToast('Task saved');
           if (mirrors) calendarSync.pushSoon(savedId);
         },
+        /** Drag and drop on the calendar: only the date changes; the time and every other detail stay as they are. */
+        moveEventToDate(eventId, dateKey) {
+          const target = getState().events.find((e) => e.id === eventId);
+          if (!target || target.readOnly || target.date === dateKey) return;
+          const mirrors = Boolean(activeGoogleUser());
+          setState((s) => ({
+            events: s.events.map((e) => (e.id === eventId
+              ? { ...e, date: dateKey, dirty: mirrors || Boolean(e.dirty), rev: (e.rev ?? 0) + 1 }
+              : e)),
+          }));
+          actions.showToast(`Moved to ${DateUtils.formatAgendaDate(DateUtils.fromKey(dateKey))}`);
+          if (mirrors) calendarSync.pushSoon(eventId, { quiet: true });
+        },
         /** Tick a task off (or back on) from the to-do list. Google Tasks get the change too; older calendar events stay local. */
         toggleTaskDone(eventId) {
           const mirrors = Boolean(activeGoogleUser());
@@ -2953,7 +2977,7 @@ const createPurposeCalendars = () => [...PURPOSES.map((purpose) => ({ ...purpose
       const range = DateUtils.formatRange(event);
 
       return `
-        <button type="button" data-event-id="${esc(event.id)}"
+        <button type="button" data-event-id="${esc(event.id)}" ${event.readOnly ? '' : 'data-draggable'}
                 aria-label="${esc(event.title)}, ${range}"
                 class="absolute overflow-hidden rounded-xl p-2 text-left text-xs leading-tight shadow-sm transition hover:brightness-110"
                 style="top:${top}px;height:${height - 2}px;left:calc(${lane * width}% + 2px);width:calc(${width}% - 4px);background:${esc(calendar?.color ?? '#888')};color:${CONFIG.EVENT_TEXT_COLOR}">
@@ -2995,10 +3019,10 @@ const createPurposeCalendars = () => [...PURPOSES.map((purpose) => ({ ...purpose
       const hasAllDay = days.some((d) => (byDate.get(DateUtils.toKey(d)) ?? []).some((e) => e.allDay));
       const allDayCells = days.map((date) => {
         const pills = (byDate.get(DateUtils.toKey(date)) ?? []).filter((e) => e.allDay).map((event) => `
-          <button type="button" data-event-id="${esc(event.id)}" aria-label="${esc(event.title)}, all day"
+          <button type="button" data-event-id="${esc(event.id)}" ${event.readOnly ? '' : 'data-draggable'} aria-label="${esc(event.title)}, all day"
                   class="block w-full truncate rounded-md px-1.5 py-0.5 text-left text-[11px] font-medium hover:brightness-110"
                   style="background:${esc(calendars.get(event.calendarId)?.color ?? '#888')};color:${CONFIG.EVENT_TEXT_COLOR}">${esc(event.title)}</button>`).join('');
-        return `<div class="flex flex-col gap-1 border-l border-line p-1">${pills}</div>`;
+        return `<div data-allday-date="${DateUtils.toKey(date)}" class="flex flex-col gap-1 border-l border-line p-1">${pills}</div>`;
       }).join('');
       const allDayRow = hasAllDay
         ? `<div class="grid border-b border-line bg-surface-raised" style="grid-template-columns:${columns}">
@@ -3055,7 +3079,7 @@ const createPurposeCalendars = () => [...PURPOSES.map((purpose) => ({ ...purpose
         const inMonth = date.getMonth() === state.currentDate.getMonth();
         const events = byDate.get(key) ?? [];
         const pills = events.slice(0, MAX_VISIBLE).map((event) => `
-          <button type="button" data-event-id="${esc(event.id)}"
+          <button type="button" data-event-id="${esc(event.id)}" ${event.readOnly ? '' : 'data-draggable'}
                   class="mb-1 block w-full truncate rounded-md px-1.5 py-0.5 text-left text-[11px] font-medium hover:brightness-110"
                   style="background:${esc(calendars.get(event.calendarId)?.color ?? '#888')};color:${CONFIG.EVENT_TEXT_COLOR}">
             ${esc(event.title)}
@@ -3110,6 +3134,131 @@ const createPurposeCalendars = () => [...PURPOSES.map((purpose) => ({ ...purpose
           }
         },
         bind(el, { store, actions }) {
+          /* ---- Drag a task onto another day (month cells, week/day columns, the all-day strip) ---- */
+          const DRAG_THRESHOLD = 6;
+          const DROP_SELECTOR = '[data-cell-date], [data-column-date], [data-allday-date]';
+          let drag = null;         // { id, x, y, started, ghost, label, offsetX, offsetY, pointer, key, raf }
+          let swallowClick = false; // the click that follows a drop must not open the editor or create a task
+
+          const dropAt = (x, y) => {
+            const node = document.elementFromPoint(x, y)?.closest(DROP_SELECTOR);
+            if (!node || !el.contains(node)) return null;
+            return node.dataset.cellDate ?? node.dataset.columnDate ?? node.dataset.alldayDate ?? null;
+          };
+          const sourceDate = () => store.getState().events.find((ev) => ev.id === drag.id)?.date;
+
+          const refresh = () => {
+            // The calendar may re-render mid-drag (sync, the clock), so the visual state is re-applied on every move.
+            el.querySelectorAll('.drop-target').forEach((node) => node.classList.remove('drop-target'));
+            el.querySelectorAll(`[data-event-id="${CSS.escape(drag.id)}"]`).forEach((node) => node.classList.add('is-dragging'));
+            const key = dropAt(drag.pointer.x, drag.pointer.y);
+            const valid = Boolean(key) && key !== sourceDate();
+            drag.key = valid ? key : null;
+            if (valid) {
+              el.querySelectorAll(`[data-cell-date="${key}"], [data-column-date="${key}"], [data-allday-date="${key}"]`)
+                .forEach((node) => node.classList.add('drop-target'));
+            }
+            drag.label.textContent = valid ? `Move to ${DateUtils.formatAgendaDate(DateUtils.fromKey(key))}` : (key ? 'Already on this day' : 'Drop on a day');
+            drag.label.toggleAttribute('data-valid', valid);
+          };
+
+          const place = () => {
+            const { x, y } = drag.pointer;
+            drag.ghost.style.left = `${x - drag.offsetX}px`;
+            drag.ghost.style.top = `${y - drag.offsetY}px`;
+            drag.label.style.left = `${Math.min(x + 16, window.innerWidth - drag.label.offsetWidth - 8)}px`;
+            drag.label.style.top = `${Math.min(y + 18, window.innerHeight - 36)}px`;
+          };
+
+          // Scroll the calendar when the pointer is held near its edge.
+          const autoScroll = () => {
+            if (!drag?.started) return;
+            const box = el.getBoundingClientRect();
+            const { x, y } = drag.pointer;
+            const speed = (distance) => Math.round(Math.max(0, 48 - distance) / 3);
+            el.scrollTop += speed(y - box.top) * -1 + speed(box.bottom - y);
+            el.scrollLeft += speed(x - box.left) * -1 + speed(box.right - x);
+            drag.raf = requestAnimationFrame(autoScroll);
+          };
+
+          const stop = () => {
+            if (!drag) return;
+            cancelAnimationFrame(drag.raf);
+            drag.ghost?.remove();
+            drag.label?.remove();
+            el.querySelectorAll('.drop-target').forEach((node) => node.classList.remove('drop-target'));
+            el.querySelectorAll('.is-dragging').forEach((node) => node.classList.remove('is-dragging'));
+            document.body.classList.remove('dragging-task');
+            window.removeEventListener('pointermove', onMove);
+            window.removeEventListener('pointerup', onUp);
+            window.removeEventListener('pointercancel', onCancel);
+            document.removeEventListener('keydown', onKey, true);
+            drag = null;
+          };
+
+          function onMove(e) {
+            if (!drag) return;
+            drag.pointer = { x: e.clientX, y: e.clientY };
+            if (!drag.started) {
+              if (Math.hypot(e.clientX - drag.x, e.clientY - drag.y) < DRAG_THRESHOLD) return;
+              const source = el.querySelector(`[data-event-id="${CSS.escape(drag.id)}"]`);
+              if (!source) return stop();
+              const rect = source.getBoundingClientRect();
+              drag.started = true;
+              drag.offsetX = drag.x - rect.left;
+              drag.offsetY = drag.y - rect.top;
+              drag.ghost = source.cloneNode(true);
+              drag.ghost.removeAttribute('data-event-id');
+              drag.ghost.removeAttribute('data-draggable');
+              drag.ghost.classList.add('drag-ghost');
+              drag.ghost.style.width = `${rect.width}px`;
+              drag.ghost.style.height = `${rect.height}px`;
+              drag.label = document.createElement('div');
+              drag.label.className = 'drag-label';
+              document.body.append(drag.ghost, drag.label);
+              document.body.classList.add('dragging-task');
+              drag.raf = requestAnimationFrame(autoScroll);
+            }
+            place();
+            refresh();
+          }
+
+          function onUp() {
+            if (!drag) return;
+            const { started, id, key } = drag;
+            stop();
+            if (!started) return;
+            swallowClick = true;
+            setTimeout(() => { swallowClick = false; }, 150);
+            if (key) actions.moveEventToDate(id, key);
+          }
+          function onCancel() { stop(); }
+          function onKey(e) {
+            if (e.key !== 'Escape' || !drag) return;
+            e.stopPropagation();
+            stop(); // Escape drops it back where it was
+            swallowClick = true;
+            setTimeout(() => { swallowClick = false; }, 150);
+          }
+
+          el.addEventListener('pointerdown', (e) => {
+            if (e.button !== 0 || e.pointerType === 'touch') return; // touch keeps scrolling the calendar
+            const item = e.target.closest('[data-draggable]');
+            if (!item || drag) return;
+            drag = { id: item.dataset.eventId, x: e.clientX, y: e.clientY, pointer: { x: e.clientX, y: e.clientY }, started: false };
+            window.addEventListener('pointermove', onMove);
+            window.addEventListener('pointerup', onUp);
+            window.addEventListener('pointercancel', onCancel);
+            document.addEventListener('keydown', onKey, true);
+          });
+          // Capture phase, so it runs before the click handler below.
+          el.addEventListener('click', (e) => {
+            if (!swallowClick) return;
+            swallowClick = false;
+            e.stopPropagation();
+            e.preventDefault();
+          }, true);
+
           el.addEventListener('click', (e) => {
             // Order matters: the most specific targets are checked first.
             const eventButton = e.target.closest('[data-event-id]');
