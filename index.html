@@ -153,6 +153,15 @@
     .drag-label[data-valid] { background: #d6ff3d; border-color: #d6ff3d; color: #09090a; font-weight: 500; }
     body.dragging-task, body.dragging-task * { cursor: grabbing !important; user-select: none !important; }
 
+    /* Reminder popups (bottom-right). They slide in, and slide out while the gap they leave collapses. */
+    .reminder { display: grid; grid-template-rows: 1fr; pointer-events: auto;
+      transition: grid-template-rows 300ms ease, opacity 300ms ease, transform 300ms ease; }
+    .reminder > div { min-height: 0; overflow: hidden; }
+    .reminder-enter { animation: reminder-in 360ms cubic-bezier(0.22, 1, 0.36, 1) both; }
+    .reminder[data-leaving] { grid-template-rows: 0fr; opacity: 0; transform: translateX(32px); pointer-events: none; }
+    @keyframes reminder-in { from { opacity: 0; transform: translateX(32px) scale(0.96); } to { opacity: 1; transform: none; } }
+    [data-switch] > span { transition: transform 220ms cubic-bezier(0.4, 0, 0.2, 1), background-color 220ms; }
+
     /* Small dark tooltip, like Notion's "Open in full page  Ctrl+Enter" chip. */
     [data-tip] { position: relative; }
     [data-tip]:hover::after, [data-tip]:focus-visible::after {
@@ -216,6 +225,7 @@
 
   <!-- Overlays live outside #app so they can cover the whole viewport -->
   <div id="slot-account-menu"></div>
+  <div id="slot-picker"></div>
   <div id="slot-auth-modal"></div>
   <div id="slot-modal"></div>
   <div id="slot-toast" aria-live="polite"
@@ -556,6 +566,7 @@ const GOOGLE_CALENDARLIST_SCOPE = 'https://www.googleapis.com/auth/calendar.cale
       close: '<path d="M18 6 6 18M6 6l12 12"/>',
       clock: '<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
       user: '<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
+      bell: '<path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/>',
       lock: '<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>',
       link: '<path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/>',
       description: '<path d="M4 6h16M4 12h16M4 18h10"/>',
@@ -585,6 +596,21 @@ const GOOGLE_CALENDARLIST_SCOPE = 'https://www.googleapis.com/auth/calendar.cale
 
     const icon = (name, classes = 'h-5 w-5') =>
       `<svg class="${classes}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICON_PATHS[name]}</svg>`;
+
+    /** Preferences (kept separate from the task data). */
+    const Settings = {
+      KEY: 'taskly.settings.v1',
+      defaults: { reminders: { enabled: true, leads: [1440, 60, 15], browser: false } }, // leads are minutes before the deadline
+      load() {
+        try {
+          const saved = JSON.parse(localStorage.getItem(this.KEY));
+          return { ...this.defaults, ...saved, reminders: { ...this.defaults.reminders, ...saved?.reminders } };
+        } catch { return structuredClone(this.defaults); }
+      },
+      save(settings) {
+        try { localStorage.setItem(this.KEY, JSON.stringify(settings)); } catch { /* ignore */ }
+      },
+    };
 
     /** Persist only what matters (events + accounts) to localStorage. */
     const Persistence = {
@@ -748,6 +774,9 @@ const createPurposeCalendars = () => [...PURPOSES.map((purpose) => ({ ...purpose
         authLoading: false,        // true while the Google popup is open
         authError: '',
         accountMenu: null,         // null | { top, left, width } (popup position)
+        settings: Settings.load(), // { reminders: { enabled, leads: [minutes], browser } }
+        notifPermission: 'Notification' in window ? Notification.permission : 'unsupported', // 'default' | 'granted' | 'denied' | 'unsupported'
+        picker: null,              // null | { source: 'mini' | 'header', mode: 'month' | 'year', year, month, top, left, width }
 
         // Data for the ACTIVE user
         accounts: current.accounts,
@@ -1984,6 +2013,46 @@ const createPurposeCalendars = () => [...PURPOSES.map((purpose) => ({ ...purpose
         shiftMiniMonth: (direction) =>
           setState((s) => ({ miniMonth: DateUtils.addMonthsClamped(s.miniMonth, direction) })),
 
+        /* Reminder settings */
+        updateReminders(patch) {
+          setState((s) => {
+            const settings = { ...s.settings, reminders: { ...s.settings.reminders, ...patch } };
+            Settings.save(settings);
+            return { settings };
+          });
+        },
+        /** Ask the browser for permission to show system notifications. Must run straight from a click. */
+        async requestNotifications() {
+          if (!('Notification' in window)) return actions.showToast("This browser doesn't support notifications.");
+          let permission = Notification.permission;
+          if (permission === 'default') permission = await Notification.requestPermission();
+          setState({ notifPermission: permission });
+          actions.updateReminders({ browser: permission === 'granted' });
+          if (permission === 'denied') actions.showToast("Notifications are blocked. Allow them in your browser's site settings.");
+        },
+
+        /* Month / year picker (opened from the month name or the year in the sidebar calendar and the calendar header) */
+        openPicker({ source, mode, rect }) {
+          const s = getState();
+          const base = source === 'mini' ? s.miniMonth : s.currentDate;
+          const width = Math.min(272, window.innerWidth - 24);
+          const left = Math.max(12, Math.min(rect.left, window.innerWidth - width - 12));
+          setState({ picker: { source, mode, year: base.getFullYear(), month: base.getMonth(), top: rect.bottom + 8, left, width } });
+        },
+        closePicker: () => setState({ picker: null }),
+        /** Month mode: change the year being browsed. Year mode: move to the next or previous block of 12 years. */
+        shiftPicker: (direction) => setState((s) => (s.picker
+          ? { picker: { ...s.picker, year: s.picker.year + direction * (s.picker.mode === 'year' ? 12 : 1) } }
+          : {})),
+        /** Jump to a month. The sidebar calendar only moves itself; the header also moves the calendar page. */
+        goToMonth(year, month) {
+          const { picker, currentDate } = getState();
+          if (picker?.source === 'mini') return setState({ miniMonth: new Date(year, month, 1), picker: null });
+          const lastDay = new Date(year, month + 1, 0).getDate();
+          actions.selectDate(new Date(year, month, Math.min(currentDate.getDate(), lastDay)));
+          setState({ picker: null });
+        },
+
         /* Sidebar */
         toggleAccount: (accountId) => setState((s) => ({
           accounts: s.accounts.map((a) => a.id === accountId ? { ...a, expanded: !a.expanded } : a),
@@ -2550,6 +2619,82 @@ const createPurposeCalendars = () => [...PURPOSES.map((purpose) => ({ ...purpose
       },
     };
 
+    /** "October 2026" as two buttons: the month name opens the month picker, the year opens the year picker. */
+    function renderMonthYearButtons(date, source) {
+      const month = date.toLocaleDateString(CONFIG.LOCALE, { month: 'long' });
+      const button = (mode, label, extra) => `
+        <button type="button" data-picker="${mode}" data-source="${source}" aria-haspopup="dialog" aria-label="Choose ${mode}: ${label}"
+                class="rounded-lg px-1.5 py-0.5 transition-colors hover:bg-white/10 ${extra}">${label}</button>`;
+      return `${button('month', month, '')}${button('year', String(date.getFullYear()), '')}`;
+    }
+
+    /* ---------- 7.3a Month / year picker ---------- */
+    const PickerModule = {
+      id: 'month-picker',
+      slot: '#slot-picker',
+      deps: (s) => [s.picker, s.currentDate, s.miniMonth, s.now],
+      render(state) {
+        const p = state.picker;
+        if (!p) return '';
+        const base = p.source === 'mini' ? state.miniMonth : state.currentDate;
+        const arrow = (dir, label, name) => `
+          <button type="button" data-picker-shift="${dir}" aria-label="${label}" class="rounded-full p-1.5 text-ink-muted transition-colors hover:bg-white/10 hover:text-ink">${icon(name, 'h-4 w-4')}</button>`;
+        const cell = (attrs, label, tone) => `
+          <button type="button" ${attrs} class="rounded-xl px-2 py-2.5 text-sm transition-colors ${tone}">${label}</button>`;
+
+        let title; let grid;
+        if (p.mode === 'year') {
+          const start = Math.floor(p.year / 12) * 12;
+          title = `${start} – ${start + 11}`;
+          grid = Array.from({ length: 12 }, (_, i) => {
+            const year = start + i;
+            const tone = year === base.getFullYear() ? 'bg-white font-medium text-black'
+              : (year === state.now.getFullYear() ? 'font-medium text-accent hover:bg-white/10' : 'text-ink hover:bg-white/10');
+            return cell(`data-pick-year="${year}"`, year, tone);
+          }).join('');
+        } else {
+          title = String(p.year);
+          grid = Array.from({ length: 12 }, (_, month) => {
+            const selected = p.year === base.getFullYear() && month === base.getMonth();
+            const current = p.year === state.now.getFullYear() && month === state.now.getMonth();
+            const tone = selected ? 'bg-white font-medium text-black' : (current ? 'font-medium text-accent hover:bg-white/10' : 'text-ink hover:bg-white/10');
+            return cell(`data-pick-month="${month}"`, new Date(2000, month, 1).toLocaleDateString(CONFIG.LOCALE, { month: 'short' }), tone);
+          }).join('');
+        }
+
+        return `
+          <div data-picker-backdrop class="fixed inset-0 z-[45]"></div>
+          <div data-picker-panel role="dialog" aria-label="Choose ${p.mode}" tabindex="-1"
+               class="fixed z-[46] rounded-2xl border border-line bg-surface-raised p-3 shadow-2xl shadow-black/60 outline-none"
+               style="top:${p.top}px;left:${p.left}px;width:${p.width}px">
+            <div class="mb-2 flex items-center justify-between px-1">
+              ${arrow(-1, p.mode === 'year' ? 'Previous years' : 'Previous year', 'chevronLeft')}
+              <span class="text-sm font-medium">${title}</span>
+              ${arrow(1, p.mode === 'year' ? 'Next years' : 'Next year', 'chevronRight')}
+            </div>
+            <div class="grid grid-cols-3 gap-1">${grid}</div>
+          </div>`;
+      },
+      afterRender(el, state) {
+        if (state.picker && !el.contains(document.activeElement)) el.querySelector('[data-picker-panel]')?.focus({ preventScroll: true });
+      },
+      bind(el, { store, actions }) {
+        el.addEventListener('click', (e) => {
+          if (e.target.matches('[data-picker-backdrop]')) return actions.closePicker();
+          const shift = e.target.closest('[data-picker-shift]');
+          if (shift) return actions.shiftPicker(Number(shift.dataset.pickerShift));
+          const month = e.target.closest('[data-pick-month]');
+          if (month) return actions.goToMonth(store.getState().picker.year, Number(month.dataset.pickMonth));
+          const year = e.target.closest('[data-pick-year]');
+          if (year) actions.goToMonth(Number(year.dataset.pickYear), store.getState().picker.month);
+        });
+        document.addEventListener('keydown', (e) => {
+          if (e.key === 'Escape' && store.getState().picker) { e.stopPropagation(); actions.closePicker(); }
+        }, true);
+        window.addEventListener('resize', () => { if (store.getState().picker) actions.closePicker(); });
+      },
+    };
+
     /* ---------- 7.3 Mini calendar ---------- */
     const MiniCalendarModule = {
       id: 'mini-calendar',
@@ -2587,7 +2732,7 @@ const createPurposeCalendars = () => [...PURPOSES.map((purpose) => ({ ...purpose
           <section class="rounded-2xl bg-surface p-4" aria-label="Month navigator">
             <div class="mb-3 flex items-center justify-between">
               <button type="button" data-mini-shift="-1" aria-label="Previous month" class="rounded-full p-1 text-ink-muted hover:text-ink">${icon('chevronLeft', 'h-4 w-4')}</button>
-              <h2 class="text-sm font-medium">${DateUtils.formatMonthYear(state.miniMonth)}</h2>
+              <h2 class="flex items-center gap-0.5 text-sm font-medium">${renderMonthYearButtons(state.miniMonth, 'mini')}</h2>
               <button type="button" data-mini-shift="1" aria-label="Next month" class="rounded-full p-1 text-ink-muted hover:text-ink">${icon('chevronRight', 'h-4 w-4')}</button>
             </div>
             <div class="mb-1 grid grid-cols-7 text-center text-xs text-ink-muted" aria-hidden="true">
@@ -2600,6 +2745,9 @@ const createPurposeCalendars = () => [...PURPOSES.map((purpose) => ({ ...purpose
         el.addEventListener('click', (e) => {
           const shiftButton = e.target.closest('[data-mini-shift]');
           if (shiftButton) return actions.shiftMiniMonth(Number(shiftButton.dataset.miniShift));
+
+          const picker = e.target.closest('[data-picker]');
+          if (picker) return actions.openPicker({ source: picker.dataset.source, mode: picker.dataset.picker, rect: picker.getBoundingClientRect() });
 
           const dayButton = e.target.closest('[data-date]');
           if (dayButton) actions.selectDate(DateUtils.fromKey(dayButton.dataset.date));
@@ -2634,13 +2782,18 @@ const createPurposeCalendars = () => [...PURPOSES.map((purpose) => ({ ...purpose
       return `${Math.floor(days / 365)}y`;
     }
 
+    /** When a task is due: the end of the event, or the end of the day for all-day tasks. */
+    function taskDeadline(event) {
+      const due = DateUtils.fromKey(event.date);
+      if (event.allDay) due.setHours(23, 59, 0, 0); else due.setMinutes(event.end ?? 0);
+      return due;
+    }
+
     /** Every visible schedule with its deadline (all-day ones are due at the end of the day). */
     function todoTasks(state) {
       const calendars = Selectors.calendarMap(state);
       return state.events.filter((event) => !event.holiday).map((event) => { // every task, even when its category is switched off in the calendar legend
-        const due = DateUtils.fromKey(event.date);
-        if (event.allDay) due.setHours(23, 59, 0, 0); else due.setMinutes(event.end ?? 0);
-        return { event, due, calendar: calendars.get(event.calendarId) };
+        return { event, due: taskDeadline(event), calendar: calendars.get(event.calendarId) };
       });
     }
 
@@ -2753,7 +2906,7 @@ const createPurposeCalendars = () => [...PURPOSES.map((purpose) => ({ ...purpose
             <div role="tablist" class="mb-3 flex gap-1 rounded-xl bg-surface-raised p-1">
               ${tab('todo', 'To do', openCount)}${tab('done', 'Done', doneTasks.length)}
             </div>
-            <div data-todo-scroll class="no-scrollbar max-h-[26rem] overflow-y-auto overflow-x-hidden">${body}</div>
+            <div data-todo-scroll class="overflow-x-clip">${body}</div>
           </section>`;
       },
 
@@ -2853,7 +3006,7 @@ const createPurposeCalendars = () => [...PURPOSES.map((purpose) => ({ ...purpose
             <div class="rounded-2xl bg-surface p-4">
               <button type="button" data-toggle-account="${esc(account.id)}" aria-expanded="${account.expanded}"
                       class="flex w-full items-center justify-between gap-2 text-left text-sm">
-                <span class="truncate">${esc(account.email)}</span>
+                <span class="truncate" title="${esc(account.email)}">Calendars</span>
                 <span class="text-ink-muted">${icon(account.expanded ? 'chevronUp' : 'chevronDown', 'h-4 w-4')}</span>
               </button>
               ${calendars}
@@ -2934,7 +3087,7 @@ const createPurposeCalendars = () => [...PURPOSES.map((purpose) => ({ ...purpose
               <button type="button" data-shift="-1" aria-label="Previous" class="${roundButton}">${icon('chevronLeft', 'h-4 w-4')}</button>
               <button type="button" data-shift="1" aria-label="Next" class="${roundButton}">${icon('chevronRight', 'h-4 w-4')}</button>
             </div>
-            <h1 class="mr-2 text-2xl">${DateUtils.formatMonthYear(state.currentDate)}</h1>
+            <h1 class="mr-2 flex items-center gap-0.5 text-2xl">${renderMonthYearButtons(state.currentDate, 'header')}</h1>
             <div class="ml-auto flex items-center gap-3">
               ${syncButton}
               <div role="group" aria-label="Calendar view" class="flex rounded-xl bg-surface-sunken p-1 text-sm">${viewButtons}</div>
@@ -2952,6 +3105,9 @@ const createPurposeCalendars = () => [...PURPOSES.map((purpose) => ({ ...purpose
 
           const shiftButton = e.target.closest('[data-shift]');
           if (shiftButton) return actions.shift(Number(shiftButton.dataset.shift));
+
+          const picker = e.target.closest('[data-picker]');
+          if (picker) return actions.openPicker({ source: picker.dataset.source, mode: picker.dataset.picker, rect: picker.getBoundingClientRect() });
 
           const actionButton = e.target.closest('[data-action]');
           if (actionButton?.dataset.action === 'today') actions.goToToday();
@@ -4516,6 +4672,172 @@ const createPurposeCalendars = () => [...PURPOSES.map((purpose) => ({ ...purpose
         : '',
     };
 
+    /* ---------- 7.8b Reminders ----------
+       Every 30 seconds (and whenever tasks or settings change) each open task is checked against the lead times
+       (1 day / 1 hour / 15 minutes by default). When one has been reached, a card slides in at the bottom-right and,
+       if allowed, a system notification appears too, so it shows on other tabs and windows. A reminder is shown once
+       per task, deadline and lead time; the ledger lives in localStorage so reloading doesn't repeat it. If several
+       lead times were missed (the page was closed), only the most urgent one is shown. */
+    function createReminders({ store, actions }) {
+      const LEDGER_KEY = 'taskly.reminders.v1';
+      const MAX_VISIBLE = 4;
+      const readLedger = () => { try { return JSON.parse(localStorage.getItem(LEDGER_KEY)) ?? {}; } catch { return {}; } };
+      const ledger = readLedger();
+      const saveLedger = () => { try { localStorage.setItem(LEDGER_KEY, JSON.stringify(ledger)); } catch { /* ignore */ } };
+      const keyOf = (id, due, lead) => `${id}|${due}|${lead}`;
+      Object.keys(ledger).forEach((k) => { if (ledger[k] < Date.now() - 3 * 86_400_000) delete ledger[k]; });
+
+      const cards = new Map(); // task id -> { node, event, due, preview }
+      let host = null;
+      const ensureHost = () => {
+        if (host) return host;
+        host = document.createElement('div');
+        host.id = 'slot-reminders';
+        host.setAttribute('role', 'region');
+        host.setAttribute('aria-label', 'Reminders');
+        host.setAttribute('aria-live', 'polite');
+        host.className = 'pointer-events-none fixed bottom-4 right-4 z-[60] flex w-[min(22rem,calc(100vw-2rem))] flex-col';
+        document.body.append(host);
+        host.addEventListener('click', (e) => {
+          const node = e.target.closest('[data-reminder]');
+          if (!node) return;
+          const id = node.dataset.reminder;
+          if (e.target.closest('[data-rem-close]')) return dismiss(id);
+          if (e.target.closest('[data-rem-open]')) {
+            const task = store.getState().events.find((ev) => ev.id === id);
+            dismiss(id);
+            if (task) actions.openEditSchedule(task);
+          }
+        });
+        return host;
+      };
+
+      const dueText = (due) => (due > Date.now() ? `Due in <span class="font-medium text-ink">${relativeSpan(due - Date.now())}</span>` : 'Due now');
+
+      function dismiss(id) {
+        const card = cards.get(id);
+        if (!card) return;
+        cards.delete(id);
+        card.node.setAttribute('data-leaving', ''); // slides out while the gap collapses
+        setTimeout(() => card.node.remove(), 320);
+      }
+
+      function refresh(card) {
+        card.node.querySelector('[data-rem-due]').innerHTML = dueText(card.due);
+        card.node.querySelector('[data-rem-title]').textContent = card.event.title || 'Untitled';
+      }
+
+      function addCard(event, due, calendar, preview) {
+        const node = document.createElement('div');
+        node.className = 'reminder reminder-enter';
+        node.dataset.reminder = event.id;
+        node.style.setProperty('--task-color', calendar?.color ?? '#888');
+        node.innerHTML = `
+          <div><div class="p-1.5 pb-2.5">
+            <div class="flex overflow-hidden rounded-2xl border border-line bg-surface-raised shadow-xl shadow-black/60">
+              <span class="w-1.5 shrink-0" style="background:var(--task-color)" aria-hidden="true"></span>
+              <button type="button" data-rem-open class="min-w-0 flex-1 p-3.5 text-left transition-colors hover:bg-white/[0.03]">
+                <span class="flex items-center gap-1.5 text-[11px] uppercase tracking-wide text-ink-muted">${icon('bell', 'h-3.5 w-3.5')}<span class="truncate">Reminder · ${esc(calendar?.name ?? 'Task')}</span></span>
+                <span data-rem-title class="mt-1 block break-words text-sm font-medium leading-snug"></span>
+                <span data-rem-due class="mt-1 block text-sm text-ink-muted"></span>
+              </button>
+              <button type="button" data-rem-close aria-label="Dismiss reminder"
+                      class="m-2 flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-ink-muted transition-colors hover:bg-white/10 hover:text-ink">${icon('close', 'h-4 w-4')}</button>
+            </div>
+          </div></div>`;
+        node.addEventListener('animationend', () => node.classList.remove('reminder-enter'), { once: true });
+        const card = { node, event, due, preview };
+        cards.set(event.id, card);
+        ensureHost().append(node);
+        refresh(card);
+      }
+
+      /** A system notification, only when you are not already looking at Taskly (or when previewing). */
+      function notify(event, due, { force = false } = {}) {
+        const { settings } = store.getState();
+        if (!force && !settings.reminders.browser) return;
+        if (!('Notification' in window) || Notification.permission !== 'granted') return;
+        if (!force && !document.hidden && document.hasFocus()) return;
+        try {
+          const note = new Notification(event.title || 'Task', {
+            body: due > Date.now() ? `Due in ${relativeSpan(due - Date.now())}` : 'Due now',
+            icon: 'favicon.png',
+            tag: `taskly-${event.id}`,
+          });
+          note.onclick = () => {
+            window.focus();
+            const task = store.getState().events.find((ev) => ev.id === event.id);
+            if (task) actions.openEditSchedule(task);
+            note.close();
+          };
+        } catch { /* some browsers only allow notifications from a service worker */ }
+      }
+
+      function check() {
+        const state = store.getState();
+        const now = Date.now();
+
+        // Keep open cards in step with their tasks: finished or deleted tasks disappear, the countdown keeps running.
+        cards.forEach((card, id) => {
+          if (card.preview) return refresh(card);
+          const task = state.events.find((ev) => ev.id === id);
+          if (!task || task.completed) return dismiss(id);
+          card.event = task;
+          card.due = taskDeadline(task).getTime();
+          refresh(card);
+        });
+
+        const { enabled, leads } = state.settings.reminders;
+        if (!enabled || !leads.length) return;
+        const sorted = [...leads].sort((a, b) => a - b);
+        const calendars = Selectors.calendarMap(state);
+
+        const ready = [];
+        state.events.forEach((task) => {
+          if (task.holiday || task.completed) return;
+          const due = taskDeadline(task).getTime();
+          if (due <= now) return;
+          const reached = sorted.filter((lead) => now >= due - lead * 60_000);
+          if (reached.some((lead) => !ledger[keyOf(task.id, due, lead)])) ready.push({ task, due, reached });
+        });
+        ready.sort((a, b) => a.due - b.due);
+
+        let changed = false;
+        ready.forEach(({ task, due, reached }) => {
+          const card = cards.get(task.id);
+          if (!card && cards.size >= MAX_VISIBLE) return; // wait for a free slot
+          reached.forEach((lead) => { ledger[keyOf(task.id, due, lead)] = now; });
+          changed = true;
+          if (card) { card.event = task; card.due = due; refresh(card); } else addCard(task, due, calendars.get(task.calendarId), false);
+          notify(task, due);
+        });
+        if (changed) saveLedger();
+      }
+
+      /** Settings page: show a sample reminder (and a system notification when allowed). */
+      function preview() {
+        const state = store.getState();
+        const sample = { id: `preview-${Date.now()}`, title: 'Sample task', calendarId: 'personal' };
+        const due = Date.now() + 15 * 60_000;
+        if (cards.size >= MAX_VISIBLE) return;
+        addCard(sample, due, Selectors.calendarMap(state).get('personal'), true);
+        notify(sample, due, { force: true });
+      }
+
+      function start() {
+        setInterval(check, 30_000);
+        document.addEventListener('visibilitychange', check);
+        window.addEventListener('focus', check);
+        let last = [store.getState().events, store.getState().settings];
+        store.subscribe((s) => {
+          if (s.events !== last[0] || s.settings !== last[1]) { last = [s.events, s.settings]; check(); }
+        });
+        setTimeout(check, 1500);
+      }
+
+      return { start, check, preview };
+    }
+
     /* ---------- 7.9 Pages ---------- */
 
     /** The calendar page is static HTML; this module only toggles its visibility by route. */
@@ -4561,6 +4883,103 @@ const createPurposeCalendars = () => [...PURPOSES.map((purpose) => ({ ...purpose
       },
     };
 
+    /** Settings: reminders. */
+    const SettingsPageModule = {
+      id: 'page-settings',
+      slot: '#page-settings',
+      createIn: '#slot-pages',
+      slotClass: 'h-full overflow-auto rounded-2xl bg-surface p-6 sm:p-8',
+      route: 'settings',
+      deps: (s) => [s.settings, s.notifPermission],
+      render(state) {
+        const r = state.settings.reminders;
+        const permission = state.notifPermission;
+        const browserOn = r.browser && permission === 'granted';
+        const browserHint = {
+          unsupported: "This browser doesn't support notifications.",
+          denied: "Blocked for this site. Allow notifications in your browser's site settings, then turn this on.",
+          default: "Shows a system notification, even when you're on another tab or window. Your browser will ask for permission.",
+          granted: "Shows a system notification when Taskly isn't the window you're looking at.",
+        }[permission];
+
+        const toggle = (name, on, label, hint, disabled = false) => `
+          <div class="flex items-start justify-between gap-6 py-4">
+            <div class="min-w-0">
+              <div class="text-sm font-medium">${label}</div>
+              <div class="mt-0.5 text-xs leading-relaxed text-ink-muted">${hint}</div>
+            </div>
+            <button type="button" data-switch role="switch" data-setting="${name}" aria-checked="${on}" aria-label="${esc(label)}" ${disabled ? 'disabled' : ''}
+                    class="relative mt-0.5 h-6 w-11 shrink-0 rounded-full border border-line transition-colors disabled:opacity-40 ${on ? 'bg-accent' : 'bg-surface-sunken'}">
+              <span class="absolute left-0.5 top-0.5 h-[18px] w-[18px] rounded-full ${on ? 'translate-x-[18px] bg-black' : 'bg-ink-muted'}"></span>
+            </button>
+          </div>`;
+
+        const LEADS = [[1440, '1 day before'], [60, '1 hour before'], [15, '15 minutes before']];
+        const leadPills = LEADS.map(([minutes, label]) => {
+          const active = r.leads.includes(minutes);
+          return `
+            <button type="button" data-lead="${minutes}" aria-pressed="${active}" ${r.enabled ? '' : 'disabled'}
+                    class="rounded-full border px-3.5 py-1.5 text-sm transition-colors disabled:opacity-40 ${active ? 'border-white bg-white font-medium text-black' : 'border-line text-ink-muted hover:text-ink'}">${label}</button>`;
+        }).join('');
+
+        return `
+          <h1 class="text-2xl">Settings</h1>
+          <p class="text-sm text-ink-muted">Reminders appear in the bottom-right corner shortly before a task is due.</p>
+
+          <section class="mt-6 w-full rounded-2xl bg-surface-raised px-5 py-2 sm:px-6" aria-label="Reminders">
+            <h2 class="pt-3 text-sm font-medium text-ink-muted">Reminders</h2>
+            ${toggle('enabled', r.enabled, 'Task reminders', 'Show a reminder before each unfinished task is due.')}
+            <div class="border-t border-line py-4">
+              <div class="mb-3 text-sm font-medium">Remind me</div>
+              <div class="flex flex-wrap gap-2">${leadPills}</div>
+            </div>
+            <div class="border-t border-line">
+              ${toggle('browser', browserOn, 'Browser notifications', browserHint, permission === 'unsupported' || !r.enabled)}
+            </div>
+            <div class="border-t border-line py-4">
+              <button type="button" data-preview class="rounded-xl border border-line px-4 py-2 text-sm transition-colors hover:bg-white/5">Preview a reminder</button>
+            </div>
+          </section>`;
+      },
+      bind(el, { store, actions, reminders }) {
+        el.addEventListener('click', (e) => {
+          const lead = e.target.closest('[data-lead]');
+          if (lead) {
+            const minutes = Number(lead.dataset.lead);
+            const { leads } = store.getState().settings.reminders;
+            return actions.updateReminders({ leads: leads.includes(minutes) ? leads.filter((m) => m !== minutes) : [...leads, minutes] });
+          }
+          if (e.target.closest('[data-preview]')) return reminders.preview();
+
+          const toggle = e.target.closest('[data-setting]');
+          if (!toggle || toggle.disabled) return;
+          const { reminders: r } = store.getState().settings;
+
+          // The page is redrawn when a setting changes, which would skip the animation. So the switch is flipped by hand
+          // first (the knob slides), and the setting is saved once the slide has played.
+          const flip = (on) => {
+            toggle.setAttribute('aria-checked', String(on));
+            toggle.classList.toggle('bg-accent', on);
+            toggle.classList.toggle('bg-surface-sunken', !on);
+            const knob = toggle.firstElementChild;
+            knob.classList.toggle('translate-x-[18px]', on);
+            knob.classList.toggle('bg-black', on);
+            knob.classList.toggle('bg-ink-muted', !on);
+          };
+          const commit = (on, patch) => { flip(on); setTimeout(() => actions.updateReminders(patch), 230); };
+
+          if (toggle.dataset.setting === 'enabled') return commit(!r.enabled, { enabled: !r.enabled });
+          if (toggle.dataset.setting === 'browser') {
+            const permission = store.getState().notifPermission;
+            const on = r.browser && permission === 'granted';
+            if (on) return commit(false, { browser: false });
+            if (permission === 'granted') return commit(true, { browser: true });
+            return actions.requestNotifications(); // asks the browser for permission, so it must run straight from the click
+          }
+        });
+      },
+    };
+
     /**
      * Factory function: one function that makes many similar modules.
      * Use this pattern whenever you'd otherwise copy-paste a module.
@@ -4585,13 +5004,15 @@ const createPurposeCalendars = () => [...PURPOSES.map((purpose) => ({ ...purpose
     function bootstrap() {
       const store = createStore(createInitialState());
       const actions = createActions(store);
-      const ctx = { store, actions }; // handed to every module
+      const reminders = createReminders({ store, actions });
+      const ctx = { store, actions, reminders }; // handed to every module
 
       // >>> ADD NEW MODULES TO THIS LIST <<<
       ModuleRegistry.register(
         RailModule,
         WorkspaceModule,
         MiniCalendarModule,
+        PickerModule,
         TodoModule,
         AccountsModule,
         CalendarPageModule,
@@ -4600,7 +5021,7 @@ const createPurposeCalendars = () => [...PURPOSES.map((purpose) => ({ ...purpose
         HomePageModule,
         createPlaceholderPage({ route: 'tasks',    title: 'Tasks',    description: 'Your task list will live here. Register a new module to build it.' }),
         createPlaceholderPage({ route: 'timer',    title: 'Timer',    description: 'A focus timer can live here. Register a new module to build it.' }),
-        createPlaceholderPage({ route: 'settings', title: 'Settings', description: 'Preferences will live here. Register a new module to build it.' }),
+        SettingsPageModule,
         AccountMenuModule,
         AuthModalModule,
         ModalModule,
@@ -4635,6 +5056,7 @@ const createPurposeCalendars = () => [...PURPOSES.map((purpose) => ({ ...purpose
 
       ModuleRegistry.mountAll(ctx);
       actions.startGoogleSync(); // background sync: poll, refocus, month navigation
+      reminders.start();         // reminder popups and system notifications
       if (CONFIG.OPEN_LOGIN_ON_LAUNCH && !store.getState().users.length) actions.openLogin('signin');
       setInterval(actions.tick, CONFIG.TICK_INTERVAL_MS); // move the "now" line
     }
